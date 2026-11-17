@@ -59,7 +59,7 @@ Then ask Claude to "run phase P0" (or `/phase P0`). Commit `.claude/phase.json` 
 ## Develop
 
 - On your own machine, install from your working copy (`./install.sh` in the clone). The links point at it, so edits are live; start a new Claude Code session to reload a skill.
-- Run all tests before pushing: `tests/run.sh`. CI runs them on Linux and macOS for every push. The phase test builds throwaway repos with local remotes, so nothing reaches GitHub or a server.
+- Run all tests before pushing: `tests/run.sh`. CI runs them on Linux for every push; the macOS workflow (installer under bash 3.2) runs when `install.sh` changes, or by hand. The phase test builds throwaway repos with local remotes, so nothing reaches GitHub or a server.
 - When a plugin changes behaviour, bump `version` in its `.claude-plugin/plugin.json`, so plugin installs pick up the update.
 
 ### Add a skill

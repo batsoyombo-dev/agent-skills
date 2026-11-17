@@ -1,0 +1,15 @@
+# install.sh must keep working with macOS's bash 3.2. macOS runners cost 10x on private repos and can
+# queue for a long time, so this runs only when the installer changes, or by hand (Actions > macos > Run).
+name: macos
+on:
+  push:
+    paths: [install.sh, tests/install/**, .github/workflows/macos.yml]
+  workflow_dispatch: {}
+jobs:
+  install:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer under /bin/bash 3.2
+        run: /bin/bash --version | head -1 && /bin/bash tests/install/install.sh
