@@ -63,6 +63,7 @@ printf 'DB_NAME=shared\nSECRET=real\n' > .env
 cat > .claude/phase.json <<EOF
 {
   "project": "the demo plan",
+  "agents": { "max": 2 },
   "plan": { "file": "docs/plan/progress.md" },
   "repos": {
     "core": { "path": ".", "primary": true },
@@ -83,6 +84,7 @@ cat > .claude/phase.json <<EOF
     "tests": ["bash test.sh"],
     "per_file": [{ "glob": "*.sh", "run": "bash -n {file}", "name": "bash -n on changed scripts" }],
     "immutable": ["migrations/*"],
+    "test_globs": ["tests/*"],
     "rules": [
       { "name": "no xtrace", "regex": "set -x", "paths": ["src/*"], "level": "fail", "message": "set -x leaks secrets" },
       { "name": "no TODO", "regex": "TODO", "paths": ["src/*"], "level": "warn" }
@@ -111,6 +113,8 @@ has "B1 routed to the app repo" "$out" "B1 +B +app +blocked"
 # ---------------------------------------------------------------- add, isolation, brief
 echo "add"
 P add A1 >/dev/null; P add a2 >/dev/null
+has "add refuses past agents.max" "$(P add A4)" "not starting A4: 2 implementers active"
+hasnt "refused add made no worktree" "$(ls .worktrees)" "^a4$"
 env1=$(cat .worktrees/a1/.env)
 has "own database per worktree" "$env1" "^DB_NAME=db_a1"
 has "secret blanked" "$env1" "^SECRET=$"
@@ -131,6 +135,7 @@ echo "gate"
   echo a1 >> routes.txt
   printf 'AKIA%s\n' ABCDEFGHIJKLMNOP > src/key.txt
   printf 'X=1\n' > .env.local
+  mkdir -p tests && printf '# markTestSkipped("later")\n' > tests/a1_test.sh
   git add -A && git commit -qm "A1: greeting" )
 out=$(P check A1)
 has "forbidden file" "$out" "FAIL  must not be committed: .env.local"
@@ -140,12 +145,14 @@ has "fail rule" "$out" "FAIL  set -x leaks secrets"
 has "warn rule" "$out" "warn  no TODO"
 has "secret scan" "$out" "FAIL  secret-looking values"
 has "review trigger" "$out" "review required \\(schema\\)"
+has "skip marker in a test file" "$out" "FAIL  skipped or focused tests added"
 has "gate fails" "$out" "RESULT: FAIL"
 
 ( cd .worktrees/a1
   git rm -q --cached .env.local; rm -f .env.local src/key.txt
   git checkout -q origin/staging -- docs/plan/progress.md migrations/2026_01_01_100000_init.sql
   printf 'hello() { greet; }\n' > src/hello.sh
+  printf '# tests hello\n' > tests/a1_test.sh
   printf '# A1 report\n## Smoke\n- `GET /index.html` → 200\n- `GET /missing` → 404\n' > .phase-report.md
   git add -A && git commit -qm "A1: fixes" )
 ( cd .worktrees/a2
@@ -172,12 +179,21 @@ has "one squash commit with code and progress" "$stat" "docs/plan/progress.md"
 hasnt "nothing untested landed" "$stat" "sneaky"
 has "rolling: A3 now waits only on A2" "$(P ready A)" "A3 .*blocked +waits on A2 "
 
-has "gate passes for A2 alone" "$(P check A2)" "RESULT: PASS"
+out=$(P check A2)
+has "gate passes for A2 alone" "$out" "RESULT: PASS"
+has "warns when no test changed" "$out" "warn  no test files changed"
+has "merge refuses a required review without approval" "$(P merge A2)" "review required \\(schema\\) and no approval"
+has "approve records the tip" "$(P approve A2 --note 'reviewer APPROVE')" "approval recorded for A2"
 has "squash conflict detected" "$(P merge A2)" "CONFLICT squashing phase/a2"
 has "sync --keep leaves the rebase" "$(P sync A2 --keep)" "left in progress"
 ( cd .worktrees/a2 && printf 'one\na1\na2\n' > routes.txt && git add routes.txt && git rebase --continue >/dev/null 2>&1 )
 has "stale gate after rebase" "$(P merge A2)" "gate has not passed"
-P check A2 >/dev/null; has "merge A2" "$(P merge A2)" "^ok"
+P check A2 >/dev/null
+has "approval is tied to the tip" "$(P merge A2)" "no approval recorded"
+P approve A2 >/dev/null; has "merge A2" "$(P merge A2)" "^ok"
+P add A3 --force >/dev/null 2>&1; P check A3 --quick >/dev/null
+has "merge queue is serial" "$(P merge A3)" "merge queue is busy with A2"
+P remove A3 --force >/dev/null
 edit 's/^\| A2 \| Add farewell \| — \| agent \| \|$/| A2 | Add farewell | — | agent | done 2026-11-17 |/' .worktrees/_integration/docs/plan/progress.md
 has "land A2" "$(P land A2 'A2: farewell')" "landed A2"
 
@@ -189,7 +205,14 @@ has "app setup hook" "$(cat "$T/app/.worktrees/b1/.setup-marker")" "app-add"
 ( cd "$T/app/.worktrees/b1" && echo screen > screen.txt && git add -A && git commit -qm "B1: screen" )
 P check B1 >/dev/null; has "merge B1" "$(P merge B1)" "write \\{sha\\}"
 edit 's/^\| B1 \| App screen \| A1 \| agent \| \|$/| B1 | App screen | A1 | agent | done 2026-11-17 (app `{sha}`) |/' .worktrees/_integration/docs/plan/progress.md
-has "land B1 in both repos" "$(P land B1 'B1: app screen')" "landed B1: core [0-9a-f]+, app [0-9a-f]+"
+printf '#!/bin/sh\necho "rejected for the test" >&2\nexit 1\n' > "$T/proj-origin.git/hooks/pre-receive"; chmod +x "$T/proj-origin.git/hooks/pre-receive"
+has "primary push fails after the app push" "$(P land B1 'B1: app screen')" "push failed 3 times"
+has "half-landed task is not re-merged" "$(P merge B1)" "half landed \\(committed\\)"
+has "abort refuses after the app push" "$(P abort)" "not aborting: B1 already pushed"
+rm "$T/proj-origin.git/hooks/pre-receive"
+has "land B1 resumes and finishes" "$(P land B1 'B1: app screen')" "landed B1: core [0-9a-f]+, app [0-9a-f]+"
+has "app got exactly one B1 commit" "$(git -C "$T/app-origin.git" log --format=%s staging | grep -c '^B1: app screen$')" "^1$"
+
 appsha=$(git -C "$T/app-origin.git" rev-parse --short=7 staging)
 has "progress row carries the app sha" "$(git -C "$T/proj-origin.git" show staging:docs/plan/progress.md)" "app \`$appsha\`"
 has "primary progress commit subject" "$(git -C "$T/proj-origin.git" log -1 --format=%s staging)" "^B1: progress \\(app $appsha\\)"
@@ -220,12 +243,14 @@ has "status --all keeps history" "$(P status --all)" "A1 +core +merged"
 # ---------------------------------------------------------------- local-only mode
 echo "local-only mode"
 git init -q -b staging "$T/loc" && cd "$T/loc" && mkdir -p docs .claude
-printf '**P0: Base**\n\n| Id | Task | Depends on | Parallel | Owner | Status |\n|---|---|---|---|---|---|\n| T0.1 | One | — | no | agent | |\n| T0.2 | Two | T0.1 | yes | agent | |\n' > docs/progress.md
+printf '**P0: Base**\n\n**Goal:** a bold label line must not become a phase.\n\n| Id | Task | Depends on | Parallel | Owner | Status |\n|---|---|---|---|---|---|\n| T0.1 | One | — | no | agent | |\n| T0.2 | Two | T0.1 | yes | agent | |\n' > docs/progress.md
 printf 'true\n' > t.sh
 printf '{"remote": null, "plan": {"file": "docs/progress.md"}, "worktree": {"env_file": ""}, "gate": {"tests": ["bash t.sh"]}, "land": {"progress_file": "docs/progress.md"}}' > .claude/phase.json
 git add -A && git commit -qm init
 has "serial flag and dotted ids" "$(P ready)" "T0.1 +P0 +main +ready +no deps; serial"
 P add T0.1 >/dev/null; ( cd .worktrees/t0_1 && echo x > x.txt && git add -A && git commit -qm "T0.1: x" )
+has "a serial task runs alone" "$(P add T0.2)" "T0.1 is serial and still active"
+
 P check T0.1 >/dev/null; P merge T0.1 >/dev/null
 edit 's/\| T0.1 \| One \| — \| no \| agent \| \|/| T0.1 | One | — | no | agent | done 2026-11-17 |/' .worktrees/_integration/docs/progress.md
 has "land fast-forwards the local base" "$(P land T0.1 'T0.1: x')" "landed T0.1"

@@ -38,6 +38,8 @@
     "conditional": [],
     "per_file": [],
     "immutable": [],
+    "test_globs": ["tests/*", "test/*", "*_test.*", "*.test.*", "*.spec.*"],
+    "require_tests": "warn",
     "rules": [
       { "name": "no debug leftovers", "regex": "\\b(console\\.log|debugger)\\b", "paths": ["src/*"], "level": "warn" }
     ],

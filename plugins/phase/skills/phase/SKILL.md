@@ -29,6 +29,7 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
 1. `$P doctor`. A FAIL stops work on that repo: tell the user the printed fix.
 2. `$P status`: tasks from earlier sessions. State lives in `<worktrees>/.phase/`, so it survives compaction and new sessions.
    - `merging`: run `$P land` if the progress file was already edited in the integration worktree, otherwise `$P abort` and merge again.
+   - `landing`: a land stopped after a commit or push (it prints the step). Run `$P land <ID> "<same message>"` again; it continues from that step. Never abort it: part of it may already be pushed.
    - `running` or `review` with an agent id: if that agent is alive in this session, wait for it. If not, run `$P check <ID> --quick`. With commits on the branch, review them and start a new implementer whose prompt says "continue: the branch already has N commits" plus the gate output. With no commits, start fresh.
    - Orphan `phase/*` branches: inspect them, then adopt with `$P add <ID>` or delete them.
 3. `$P overlap` when anything is active.
@@ -50,6 +51,7 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
 - **Concurrency:**
   - At most `agents.max` implementers at once. Respect a repo's `max_agents` and the phase caps.
   - A `serial` task runs with no other task active in the same repo.
+  - `$P add` enforces these and refuses with the reason. Pass `--force` only when the user agreed.
   - Don't run two tasks together whose specs rework the same feature (same module, service or table); start the second after the first lands. Shared wiring files (route lists, registries, indexes) are fine: they merge, and the checks catch the rest.
 - Tell the user in 2–3 lines what you start, what you skip and why, then go. Wait for a yes only when a task needs something from them.
 
@@ -74,8 +76,10 @@ The agents run in the background and you are notified as each finishes. Don't po
    - FAIL: send the lines back to the same agent (SendMessage), or fix small things in the worktree yourself, commit, and check again.
 2. Read the diff against the spec and the report (the diff command is in `$P review-brief <ID>`), and check each done-when point.
 3. If the gate printed `review required (...)`, start a `phase-reviewer` agent in the background with `$P review-brief <ID>` as its prompt. Don't add your own conclusions.
-   - On `VERDICT: CHANGES`: blockers and majors go back to the implementer, or you fix them; then gate again.
+   - On `VERDICT: CHANGES`: blockers and majors go back to the implementer, or you fix them; then gate again. Send a blocker fix to the reviewer again.
    - Minors you may record and skip.
+   - Then record it: `$P approve <ID> --note "<reviewer APPROVE, or which findings you verified fixed>"`. Merge refuses a required review without an approval for the current tip, so a new commit needs a new approval.
+
 4. Check anything the gate can't, such as device or browser behaviour the spec asks for, the way the project rules say.
 
 ## 4. Merge queue (one task at a time, in finishing order)

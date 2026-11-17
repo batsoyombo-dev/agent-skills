@@ -24,7 +24,7 @@ import urllib.request
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORT = ".phase-report.md"
 INTEGRATION = "_integration"
-ACTIVE = ("running", "review", "merging")
+ACTIVE = ("running", "review", "merging", "landing")
 
 DEFAULTS = {
     "project": "",
@@ -78,6 +78,13 @@ DEFAULTS = {
         "immutable": [],
         "rules": [],
         "secret_exclude": [],
+        "test_globs": [],
+        "require_tests": "warn",
+        "no_tests_needed": ["*.md", "docs/*"],
+        "skip_markers": (
+            r"\bmarkTest(Skipped|Incomplete)\(|->skip\(|@skip\b|\b(it|describe|test)\.(skip|only)\(|\bx(it|describe)\("
+            r"|\bfdescribe\(|@pytest\.mark\.(skip|xfail)|\bt\.Skip(Now)?\(|\bskip:\s*(true|['\"])"
+        ),
         "review": {"lines": 400, "triggers": []},
     },
     "land": {
@@ -329,6 +336,15 @@ class Project:
 HEADING = re.compile(r"^(?:\*\*(?P<b>[^*]+)\*\*(?P<brest>.*)|#{2,4}\s+(?P<h>.+))$")
 
 
+def heading_kind(s):
+    h = HEADING.match(s)
+    if not h or s.startswith("|"):
+        return None
+    if h.group("b") is not None:
+        return "label" if h.group("b").rstrip().endswith(":") else "bold"
+    return "h"
+
+
 def split_row(line):
     cells = line.strip().strip("|").split("|")
     return [c.strip() for c in cells]
@@ -338,11 +354,23 @@ def parse_plan(text, pcfg, repos, primary):
     """Markdown tables under bold or ## headings. Returns a list of task dicts."""
     tasks, phase, header = [], None, None
     want = {k: [a.lower() for a in v] for k, v in pcfg["columns"].items()}
+    lines = text.splitlines()
+    kinds = [heading_kind(l.strip()) for l in lines]
+    # A bold line is a phase heading only when a table follows before the next heading; `**Label:** text`
+    # is always prose. Without this a bold sentence inside a phase would take its tasks over.
+    real, seen = set(), False
+    for i in range(len(lines) - 1, -1, -1):
+        if kinds[i] in ("bold", "h"):
+            if seen or kinds[i] == "h":
+                real.add(i)
+            seen = False
+        elif lines[i].strip().startswith("|"):
+            seen = True
 
-    for line in text.splitlines():
+    for i, line in enumerate(lines):
         s = line.strip()
-        h = HEADING.match(s)
-        if h and not s.startswith("|"):
+        h = HEADING.match(s) if i in real else None
+        if h:
             title = (h.group("b") or h.group("h") or "").strip()
             rest = h.group("brest") or ""
             m = re.match(r"^([A-Za-z][A-Za-z0-9.]*)\s*:\s*(.*)$", title)
@@ -732,6 +760,31 @@ def find_task(proj, task):
     return lower.get(task.lower())
 
 
+def capacity_problems(proj, task, repo, row, serial):
+    """Why starting `task` now would break agents.max, a repo's max_agents, a phase cap or a serial task."""
+    active = [s for s in proj.states() if s.get("status") in ACTIVE and norm_id(s.get("task", "")) != norm_id(task)]
+    building = [s for s in active if s.get("status") in ("running", "review")]
+    in_repo = [s for s in active if s.get("repo", proj.primary) == repo]
+    out = []
+    mx = proj.cfg["agents"].get("max")
+    if mx and len(building) >= int(mx):
+        out.append("%d implementers active (agents.max %s): %s" % (len(building), mx, ", ".join(s["task"] for s in building)))
+    rmax = proj.repos.get(repo, {}).get("max_agents")
+    repo_building = [s for s in building if s.get("repo", proj.primary) == repo]
+    if rmax and len(repo_building) >= int(rmax):
+        out.append("%d active in repo %s (max_agents %s)" % (len(repo_building), repo, rmax))
+    cap = row["phase"]["cap"] if row else None
+    same_phase = [s for s in building if row and s.get("phase") == row["phase"]["id"]]
+    if cap and len(same_phase) >= cap:
+        out.append("%d active in phase %s (cap %d)" % (len(same_phase), row["phase"]["id"], cap))
+    if serial and in_repo:
+        out.append("%s is serial and %s is active in repo %s" % (task, ", ".join(s["task"] for s in in_repo), repo))
+    for s in in_repo:
+        if s.get("serial"):
+            out.append("%s is serial and still active in repo %s" % (s["task"], repo))
+    return out
+
+
 def cmd_add(proj, args):
     task = args.task
     if norm_id(task) == norm_id(INTEGRATION) or norm_id(task) == "integration":
@@ -742,6 +795,11 @@ def cmd_add(proj, args):
     else:
         info("WARN: %s is not in the plan; adding it anyway (ad-hoc task)" % task)
     repo = args.repo or proj.state(task).get("repo") or (row["repo"] if row else proj.primary)
+    serial = bool(row) and row.get("parallel", "").strip().lower() in proj.cfg["plan"]["serial_values"]
+    if proj.state(task).get("status") not in ACTIVE:
+        full = capacity_problems(proj, task, repo, row, serial)
+        if full and not args.force:
+            die("not starting %s: %s. Start it after one lands, or pass --force if the user agreed" % (task, "; ".join(full)))
     root = proj.repo_root(repo)
     w = proj.rcfg(repo, "worktree")
     wt = os.path.join(root, w["dir"], norm_id(task))
@@ -762,7 +820,8 @@ def cmd_add(proj, args):
             os.replace(proj.sfile(task), proj.sfile(task) + ".old")
         st = proj.save(task, status="running", started=now())
     slot = st.get("slot") or alloc_slot(proj)
-    proj.save(task, task=task, repo=repo, branch=branch, worktree=wt, slot=slot,
+    proj.save(task, task=task, repo=repo, branch=branch, worktree=wt, slot=slot, serial=serial,
+              phase=row["phase"]["id"] if row else "",
               port=proj.cfg["slots"]["port_base"] + int(slot), date=datetime.date.today().strftime("%Y_%m_%d"),
               base=st.get("base") or git(wt, "merge-base", proj.base_ref(), "HEAD"))
     c = proj.ctx(task, repo)
@@ -1004,8 +1063,25 @@ def cmd_check(proj, args):
     if not bad:
         P("no forbidden, owned or immutable files touched")
 
+    tg = g["test_globs"]
+    if tg:
+        tests_changed = [p for s_, p in files if s_ != "D" and glob_any(p, tg)]
+        code_changed = [p for s_, p in files if not glob_any(p, tg) and not glob_any(p, g["no_tests_needed"])]
+        if code_changed and not tests_changed:
+            (F if g["require_tests"] == "fail" else W)(
+                "no test files changed (test_globs %s) for %d changed code file(s)" % (", ".join(tg), len(code_changed)))
+        elif tests_changed:
+            P("%d test file(s) added or changed" % len(tests_changed))
+        if g["skip_markers"]:
+            hits = [h for h in added_lines(wt, base, tg) if re.search(g["skip_markers"], h[2])]
+            if hits:
+                F("skipped or focused tests added:", ["%s:%d: %s" % (f, n, t.strip()[:140]) for f, n, t in hits[:20]])
+            else:
+                P("no skipped or focused tests added")
+
     for rule in g["rules"]:
         hits = [h for h in added_lines(wt, base, rule.get("paths"), rule.get("exclude"))
+
                 if re.search(rule["regex"], h[2])]
         msg = rule.get("message", rule.get("name", rule["regex"]))
         lines = ["%s:%d: %s" % (f, n, t.strip()[:140]) for f, n, t in hits[:20]]
@@ -1070,11 +1146,19 @@ def cmd_merge(proj, args):
     task, repo = st["task"], st.get("repo", proj.primary)
     if st.get("status") == "merged":
         die(task + " is already merged")
+    if st.get("status") == "landing":
+        die("%s is half landed (%s); finish it: %s land %s \"<message>\"" % (task, st.get("land_step"), proj.script, task))
+    busy = [s["task"] for s in proj.states() if s.get("status") in ("merging", "landing") and s.get("task") != task]
+    if busy:
+        die("the merge queue is busy with %s: land it (or abort) first" % ", ".join(busy))
     root = proj.repo_root(repo)
     br = "phase/" + norm_id(task)
     tip = git(root, "rev-parse", br)
     if st.get("check") != "pass:" + tip:
         die("the gate has not passed on the tip of %s (%s). Run: %s check %s" % (br, tip[:7], proj.script, task))
+    if (st.get("review") or "").startswith("required") and st.get("approved") != tip:
+        die("review %s and no approval recorded for the tip %s. After the reviewer's APPROVE (or after you verified its "
+            "findings are fixed): %s approve %s --note \"<who/what>\"" % (st["review"], tip[:7], proj.script, task))
     iw = ensure_int(proj, repo)
     if repo != proj.primary:
         ensure_int(proj, proj.primary)
@@ -1165,45 +1249,60 @@ def commit(d, msg):
 
 
 def cmd_land(proj, args):
+    """Commit and push a staged merge. Resumable: each step is recorded (land_step), so after a failed push,
+    running land again continues where it stopped instead of redoing or losing work."""
     st = proj.state(args.task)
     if not st:
         die("unknown task " + args.task)
     task, repo = st["task"], st.get("repo", proj.primary)
-    if st.get("status") != "merging":
+    if st.get("status") not in ("merging", "landing"):
         die("%s has no staged merge; run: %s merge %s" % (task, proj.script, task))
+    step = st.get("land_step", "") if st.get("status") == "landing" else ""
+    if step:
+        info("resuming land of %s after step '%s'" % (task, step))
     iw, piw = proj.int_wt(repo), proj.int_wt(proj.primary)
-    if git(iw, "rev-parse", "HEAD") != st.get("merge_onto"):
+    if not step and git(iw, "rev-parse", "HEAD") != st.get("merge_onto"):
         die("integration HEAD moved since merge; run merge again")
     land = proj.cfg["land"]
     pf = land["progress_file"]
-    if pf and land["require_progress"] and git_ok(piw, "diff", "--quiet", "HEAD", "--", pf):
+    if not step and pf and land["require_progress"] and git_ok(piw, "diff", "--quiet", "HEAD", "--", pf):
         die("%s is unchanged in %s: update it first (same commit as the work)" % (pf, piw))
     allowed = land["allow_after_merge"] + ([pf] if pf else [])
     c = proj.ctx(task)
     c.update({"wt": iw, "id": "integration"})
+    other = st.get("other_commit") or None
     if repo == proj.primary:
-        extra = [p for p in worktree_edits(iw) if not glob_any(p, allowed)]
-        if extra:
-            die("files changed after merge's checks ran (untested): %s. Fix on the task branch, or abort and merge again" % ", ".join(extra))
-        commit(iw, args.message)
+        if not step:
+            extra = [p for p in worktree_edits(iw) if not glob_any(p, allowed)]
+            if extra:
+                die("files changed after merge's checks ran (untested): %s. Fix on the task branch, or abort and merge again" % ", ".join(extra))
+            commit(iw, args.message)
+            proj.save(task, status="landing", land_step="committed")
         sha = push(proj, iw, repo, c)
-        other = None
     else:
-        extra = [p for p in worktree_edits(piw) + git(piw, "diff", "--cached", "--name-only").splitlines()
-                 if not glob_any(p, allowed)]
-        if extra:
-            die("primary integration has changes outside %s: %s" % (allowed, ", ".join(extra)))
-        if worktree_edits(iw):
-            die("%s integration has edits after the checks ran: %s" % (repo, ", ".join(worktree_edits(iw))))
-        commit(iw, args.message)
-        other = push(proj, iw, repo, c)
-        if pf:
-            path = os.path.join(piw, pf)
-            text = open(path, encoding="utf-8").read().replace("{sha}", other[:7])
-            open(path, "w", encoding="utf-8").write(text)
-        lines = args.message.splitlines()
-        subject = "%s: progress (%s %s)" % (task, repo, other[:7])
-        commit(piw, "\n".join([subject] + lines[1:]))
+        if not step:
+            extra = [p for p in worktree_edits(piw) + git(piw, "diff", "--cached", "--name-only").splitlines()
+                     if not glob_any(p, allowed)]
+            if extra:
+                die("primary integration has changes outside %s: %s" % (allowed, ", ".join(extra)))
+            if worktree_edits(iw):
+                die("%s integration has edits after the checks ran: %s" % (repo, ", ".join(worktree_edits(iw))))
+            commit(iw, args.message)
+            proj.save(task, status="landing", land_step="other_committed")
+            step = "other_committed"
+        if step == "other_committed":
+            other = push(proj, iw, repo, c)
+            proj.save(task, land_step="other_pushed", other_commit=other)
+            step = "other_pushed"
+        if step == "other_pushed":
+            if pf:
+                path = os.path.join(piw, pf)
+                text = open(path, encoding="utf-8").read().replace("{sha}", other[:7])
+                open(path, "w", encoding="utf-8").write(text)
+            lines = args.message.splitlines()
+            subject = "%s: progress (%s %s)" % (task, repo, other[:7])
+            commit(piw, "\n".join([subject] + lines[1:]))
+            proj.save(task, land_step="committed")
         pc = proj.ctx(task, proj.primary)
         pc.update({"wt": piw, "id": "integration"})
         sha = push(proj, piw, proj.primary, pc)
@@ -1213,8 +1312,10 @@ def cmd_land(proj, args):
     proj.save(task, status="merged", commit=sha, other_commit=other or "", merged_at=now())
     print("landed %s: %s %s%s on %s" % (task, proj.primary, sha[:7], (", %s %s" % (repo, other[:7])) if other else "", proj.base))
     nxt = []
-    if proj.rcfg(repo, "deploy") or proj.rcfg(proj.primary, "deploy"):
+    if proj.rcfg(proj.primary, "deploy"):
         nxt.append("%s deploy-wait %s (in the background)" % (proj.script, sha))
+    if other and proj.repos.get(repo, {}).get("deploy"):
+        nxt.append("%s deploy-wait %s --repo %s (in the background)" % (proj.script, other, repo))
     if proj.cfg.get("smoke"):
         nxt.append("%s smoke %s" % (proj.script, task))
     nxt.append("%s remove %s" % (proj.script, task))
@@ -1223,6 +1324,10 @@ def cmd_land(proj, args):
 
 
 def cmd_abort(proj, args):
+    pushed = [s for s in proj.states() if s.get("status") == "landing" and s.get("other_commit")]
+    if pushed:
+        die("not aborting: %s already pushed its %s commit; finish with: %s land %s \"<message>\""
+            % (pushed[0]["task"], pushed[0].get("repo"), proj.script, pushed[0]["task"]))
     for repo in proj.repos or {proj.primary: {}}:
         try:
             iw = proj.int_wt(repo)
@@ -1236,9 +1341,19 @@ def cmd_abort(proj, args):
         git(iw, "clean", "-qfd")
         print("reset %s to %s" % (iw, proj.base_ref()))
     for st in proj.states():
-        if st.get("status") == "merging":
-            proj.save(st["task"], status="review")
+        if st.get("status") in ("merging", "landing"):
+            proj.save(st["task"], status="review", land_step="")
             print("%s back to review" % st["task"])
+
+
+def cmd_approve(proj, args):
+    st = proj.state(args.task)
+    if not st:
+        die("unknown task " + args.task)
+    task, repo = st["task"], st.get("repo", proj.primary)
+    tip = git(proj.repo_root(repo), "rev-parse", "phase/" + norm_id(task))
+    proj.save(task, approved=tip, approved_note=args.note or "")
+    print("review approval recorded for %s @ %s%s" % (task, tip[:7], (": " + args.note) if args.note else ""))
 
 
 def gh_json(args):
@@ -1396,16 +1511,19 @@ Plan
   brief <ID> [--inline-rules] implementer prompt (after add)
   review-brief <ID>           reviewer prompt
 Work
-  add <ID> [--repo NAME]      worktree + branch phase/<id> from the base, env, slot/port, setup hooks; resumes
+  add <ID> [--repo NAME]      worktree + branch phase/<id> from the base, env, slot/port, setup hooks; resumes.
+      [--force]               refuses past agents.max, a repo's max_agents, a phase cap or a serial task
   note <ID> key=value ...     record agent=<agent id>, status=review, ...
   status [--all]              every task: status, agent, ahead/behind, tree, gate, review need, last commit
   overlap                     files touched by more than one active task, or by the base since a task was cut
   sync <ID> [--keep]          rebase the task onto the base (aborts on conflict unless --keep), refresh hooks
-  check <ID> [--quick]        the gate: forbidden/owned/immutable files, rules, secrets, per-file checks, tests
+  check <ID> [--quick]        the gate: forbidden/owned/immutable files, rules, secrets, tests changed, skip
+                              markers, per-file checks, test commands
+  approve <ID> [--note TEXT]  record that a required review approved the current tip (merge needs it)
 Land (orchestrator only, one task at a time)
   merge <ID>                  squash onto a fresh base in <worktrees>/_integration and run the checks
   land <ID> "<message>"       commit with the progress edit and push (secondary repo: its commit, then a
-                              primary progress commit with {sha} filled in)
+                              primary progress commit with {sha} filled in). Resumable after a failed push
   abort                       drop a staged merge
   deploy-wait [SHA] [--repo]  follow the GitHub Actions deploy run for SHA (also through cancelled runs)
   smoke <ID>                  run the "## Smoke" lines of the task's report against smoke.base_url
@@ -1426,7 +1544,7 @@ def main(argv):
         print(HELP)
         return 0
     sub = argparse.ArgumentParser(prog="phase.py " + cmd)
-    if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove"):
+    if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove", "approve"):
         sub.add_argument("task")
     if cmd == "ready":
         sub.add_argument("scope", nargs="*")
@@ -1435,6 +1553,9 @@ def main(argv):
     if cmd == "add":
         sub.add_argument("repo_pos", nargs="?")
         sub.add_argument("--repo")
+        sub.add_argument("--force", action="store_true")
+    if cmd == "approve":
+        sub.add_argument("--note")
     if cmd == "note":
         sub.add_argument("pairs", nargs="+")
     if cmd == "status":
@@ -1459,7 +1580,8 @@ def main(argv):
     table = {
         "doctor": cmd_doctor, "ready": cmd_ready, "brief": cmd_brief, "review-brief": cmd_review_brief,
         "add": cmd_add, "note": cmd_note, "status": cmd_status, "overlap": cmd_overlap, "sync": cmd_sync,
-        "check": cmd_check, "merge": cmd_merge, "land": cmd_land, "abort": cmd_abort,
+        "check": cmd_check, "merge": cmd_merge, "land": cmd_land, "abort": cmd_abort, "approve": cmd_approve,
+
         "deploy-wait": cmd_deploy_wait, "smoke": cmd_smoke, "remove": cmd_remove,
     }
     if cmd not in table:

@@ -28,7 +28,8 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `base` | branch tasks are cut from and land on (default `staging`) |
 | `remote` | remote name (default `origin`); `null` = local only, so land fast-forwards the local base branch |
 | `vars` | values for placeholders (tool paths and the like) |
-| `agents.max` | implementers at once (default 5) |
+| `agents.max` | implementers at once (default 5). `add` refuses past it, past a repo's `max_agents`, past a phase cap, and next to a serial task, unless `--force` |
+
 | `plan.file` | the plan file with the task tables, read from the base branch (required) |
 | `plan.columns` | header names per field: `id`, `task`, `deps`, `status`, `owner`, `spec`, `done_when`, `parallel` (case-insensitive lists) |
 | `plan.done` | regex on status that means done (default `^done\b`) |
@@ -58,6 +59,10 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `gate.immutable` | globs where existing files must not change, only new ones be added (applied migrations, baselines) |
 | `gate.rules` | `[{name, regex, paths, exclude, level: fail\|warn, message}]` on added lines |
 | `gate.secret_exclude` | globs skipped by the built-in secret scan (public client keys) |
+| `gate.test_globs` | globs of test files. When set, the gate checks that code changes come with test changes, and fails on skipped or focused tests added in them |
+| `gate.require_tests` | `warn` (default) or `fail` when code changed but no file in `test_globs` did |
+| `gate.no_tests_needed` | changed paths that need no tests (default `*.md`, `docs/*`) |
+| `gate.skip_markers` | regex for skipped/focused tests on added lines in `test_globs` (default covers PHPUnit, Jest/Vitest/Mocha, pytest, Go, Flutter `skip:`); empty to turn off |
 | `gate.review.lines` | changed lines above which review is required (default 400) |
 | `gate.review.triggers` | `[{name, paths: regex}]`; a match makes review required, with that reason |
 | `land.progress_file` | must change in the landing commit; empty to skip |
@@ -76,3 +81,9 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 ## Plan format
 
 Markdown tables under phase headings, either `**P0: Name**` or `## P0: Name` (text after the bold title, such as "(max 2 agents)", feeds `cap`, `manual_phases` and the repo markers). The first row whose cell matches `columns.id` is the header. Dependencies are separated by `,`, `;` or `+`. Ranges expand: `A1–A4`, `T0.1-T0.3`, `E2a–E2e`. Any other word ("adoption") makes the task `manual` with a "gated on" note. Status text that isn't done makes the task `partial`.
+
+## Merge-queue guarantees
+
+- `merge` needs a passed gate on the branch tip, and when the gate said `review required`, an `approve` for that same tip.
+- Only one task is in `merging` or `landing` at a time.
+- `land` records each step (`land_step`: `committed`, `other_committed`, `other_pushed`). If a push fails, running `land` again continues from there; `merge` and `abort` refuse while a secondary-repo commit is already pushed.
