@@ -27,6 +27,7 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
 ## 0. Preflight and resume (every run)
 
 1. `$P doctor`. A FAIL stops work on that repo: tell the user the printed fix.
+   - **One orchestrator per project.** The first command that changes tasks takes this session's lease. Exit code **3** (`busy:`) means another live session orchestrates the project, or the merge queue is in use: tell the user who (the message says) and stop; headless, just exit. Never `lease release --force` a session that may still be running: its agents would be duplicated. A lease whose Claude process has exited is taken over automatically, and its active tasks are named so you can resume them.
 2. `$P status`: tasks from earlier sessions. State lives in `<worktrees>/.phase/`, so it survives compaction and new sessions.
    - `merging`: run `$P land` if the progress file was already edited in the integration worktree, otherwise `$P abort` and merge again.
    - `landing`: a land stopped after a commit or push (it prints the step). Run `$P land <ID> "<same message>"` again; it continues from that step. Never abort it: part of it may already be pushed.
@@ -130,3 +131,10 @@ Finish with a short summary:
 - the next command
 
 Never release to production yourself.
+
+When you stop and no task is active (`$P status` shows none running, in review, merging or landing), `$P lease release`, so another session or a scheduled run can take over. With tasks still active, keep the lease.
+
+## Running it unattended
+
+- `/loop 30m /phase all` in an open session: each round resumes, lands what finished and starts what became ready. Same session, same lease.
+- A scheduled headless run (`claude -p "/phase all"` from cron or launchd) is safe next to an interactive session: whichever runs second gets exit 3 and stops. It needs a permission allowlist for `phase.py`, git and the project's test tools, and a lower `agents.max` keeps usage limits in check.

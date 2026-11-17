@@ -94,3 +94,10 @@ Markdown tables under phase headings, either `**P0: Name**` or `## P0: Name` (te
 - `merge` needs a passed gate on the branch tip, and when the gate said `review required`, an `approve` for that same tip.
 - Only one task is in `merging` or `landing` at a time.
 - `land` records each step (`land_step`: `committed`, `other_committed`, `other_pushed`). If a push fails, running `land` again continues from there; `merge` and `abort` refuse while a secondary-repo commit is already pushed.
+
+## Sessions and locks
+
+- **Lease** (`.phase/lease.json`): one orchestrator session per project. `add`, `note`, `merge`, `land`, `abort`, `approve`, `mark` and `remove` take or renew it. The session is `PHASE_SESSION`, else Claude Code's session id, else `terminal:<user>@<host>`; its pid is `PHASE_SESSION_PID`, else `CLAUDE_PID`. Another session is refused with exit code 3 while the holder's process is alive (same host); a lease with no pid, or from another host, holds until released. `lease`, `lease release`, `lease release --force`. Read-only commands and the implementer's `check` and `sync` don't need it.
+- **State lock** (`.phase/state.lock`, flock, waits up to 60 s): every state write, and `add`'s capacity check + slot allocation + claim as one step, so racing adds can't exceed the limits or share a slot.
+- **Queue lock** (`.phase/queue.lock`, flock, no wait): held for all of `merge`, `land`, `mark` and `abort`, which share the integration worktree. Busy = exit 3.
+- flock locks are dropped by the kernel when a process exits, crash included, and are not inherited by hooks or test commands. They need a local filesystem: don't put `worktree.dir` on NFS.

@@ -1,6 +1,6 @@
 {
   "name": "phase",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Run a project's plan tasks in parallel: one worktree and agent per task, a deterministic gate, independent review, and a serial merge queue onto the base branch. Configured per repo in .claude/phase.json.",
   "author": { "name": "batsoyombo-dev" },
   "keywords": ["orchestration", "worktrees", "parallel", "merge-queue", "quality-gates"]

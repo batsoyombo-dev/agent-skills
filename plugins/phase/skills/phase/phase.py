@@ -8,13 +8,16 @@ Source: github.com/batsoyombo-dev/agent-skills (plugins/phase).
 
 import base64
 import datetime
+import fcntl
 import fnmatch
+import getpass
 import glob
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -113,6 +116,10 @@ SECRETS = re.compile(
 
 class Fail(Exception):
     pass
+
+
+class Busy(Fail):
+    """Another process or orchestrator session holds what this command needs. Exit code 3: retry later."""
 
 
 def die(msg):
@@ -270,22 +277,37 @@ class Project:
         return json.load(open(f)) if os.path.isfile(f) else {}
 
     def save(self, _task, **kv):
-        os.makedirs(self.state_dir, exist_ok=True)
-        st = self.state(_task)
-        st.setdefault("task", _task)
-        st.update(kv)
-        st["updated"] = now()
-        tmp = self.sfile(_task) + ".tmp"
-        json.dump(st, open(tmp, "w"), indent=1, sort_keys=True)
-        os.replace(tmp, self.sfile(_task))
-        return st
+        with self.lock():
+            os.makedirs(self.state_dir, exist_ok=True)
+            st = self.state(_task)
+            st.setdefault("task", _task)
+            st.update(kv)
+            st["updated"] = now()
+            tmp = self.sfile(_task) + ".tmp.%d" % os.getpid()
+            with open(tmp, "w") as f:
+                json.dump(st, f, indent=1, sort_keys=True)
+            os.replace(tmp, self.sfile(_task))
+            return st
+
+    # -- locks (see FileLock and the lease functions below)
+    def lock(self):
+        """Short state lock: every read-modify-write of state and every check-then-claim holds it."""
+        if not hasattr(self, "_state_lock"):
+            self._state_lock = FileLock(os.path.join(self.state_dir, "state.lock"), "state", wait=60)
+        return self._state_lock
+
+    def queue_lock(self):
+        """The merge queue: held for the whole of merge, land, mark and abort (they share the integration worktree)."""
+        if not hasattr(self, "_queue_lock"):
+            self._queue_lock = FileLock(os.path.join(self.state_dir, "queue.lock"), "merge queue", wait=0)
+        return self._queue_lock
 
     def states(self):
         if not os.path.isdir(self.state_dir):
             return []
         out = []
         for name in sorted(os.listdir(self.state_dir)):
-            if name.endswith(".json"):
+            if name.endswith(".json") and name != "lease.json":
                 out.append(json.load(open(os.path.join(self.state_dir, name))))
         return out
 
@@ -331,6 +353,149 @@ class Project:
             info("%s not on %s; reading the local copy" % (self.cfg["plan"]["file"], self.base_ref()))
             return open(local, encoding="utf-8").read()
         die("plan file %s not found on %s or locally" % (self.cfg["plan"]["file"], self.base_ref()))
+
+
+# ---------------------------------------------------------------- locks and the orchestrator lease
+#
+# Two kinds of exclusion, because a Claude session is not one process (every Bash call is a new one):
+# - FileLock: flock(2) on a lock file, for the duration of one command. The kernel drops it when the process
+#   exits, crash included, so there are no stale locks. Descriptors are close-on-exec, so hooks and test
+#   commands never inherit it. Needs a local filesystem (flock is unreliable on NFS).
+# - The lease: a file naming the orchestrator session, for the duration of a whole /phase run. Commands that
+#   change tasks take or renew it; another session is refused (exit 3) until the holder releases it or its
+#   Claude process has exited. An idle but open session keeps it: its agents may still be working.
+
+class FileLock:
+    def __init__(self, path, what, wait):
+        self.path, self.what, self.wait = path, what, wait
+        self.fd, self.depth = None, 0
+
+    def __enter__(self):
+        if self.depth:
+            self.depth += 1
+            return self
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        deadline = time.time() + self.wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    try:
+                        holder = os.pread(fd, 4096, 0).decode("utf-8", "replace").strip()
+                    except OSError:
+                        holder = ""
+                    os.close(fd)
+                    raise Busy("the %s is in use%s; try again when it finishes"
+                               % (self.what, (" by " + holder) if holder else ""))
+                time.sleep(0.1)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, ("pid %d (%s) since %s" % (os.getpid(), " ".join(sys.argv[1:4]), now())).encode(), 0)
+        self.fd, self.depth = fd, 1
+        return self
+
+    def __exit__(self, *exc):
+        self.depth -= 1
+        if self.depth == 0:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+        return False
+
+
+LEASE_COMMANDS = ("add", "note", "merge", "land", "abort", "approve", "mark", "remove")
+
+
+def session_identity():
+    """Who is orchestrating: PHASE_SESSION, else the Claude Code session, else this user at a terminal."""
+    sid = os.environ.get("PHASE_SESSION") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    pid = os.environ.get("PHASE_SESSION_PID") or os.environ.get("CLAUDE_PID")
+    if not sid:
+        return "terminal:%s@%s" % (getpass.getuser(), socket.gethostname()), None
+    return sid, int(pid) if pid and pid.isdigit() else None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def lease_path(proj):
+    return os.path.join(proj.state_dir, "lease.json")
+
+
+def read_lease(proj):
+    try:
+        with open(lease_path(proj)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def lease_holder_alive(lease):
+    """A lease ends only when its holder is provably gone: same host and its process has exited."""
+    if lease.get("host") == socket.gethostname() and lease.get("pid"):
+        return pid_alive(int(lease["pid"]))
+    return True  # unknown pid (terminal use) or another host: held until released
+
+
+def describe_lease(lease):
+    return "session %s (pid %s on %s, since %s, last active %s)" % (
+        lease.get("session"), lease.get("pid") or "-", lease.get("host"), lease.get("acquired"), lease.get("renewed"))
+
+
+def take_lease(proj, command):
+    sid, pid = session_identity()
+    with proj.lock():
+        cur = read_lease(proj)
+        if cur and cur.get("session") != sid:
+            if lease_holder_alive(cur):
+                raise Busy("another orchestrator holds this project: %s. Wait for it to finish, or if it is gone: "
+                           "%s lease release --force" % (describe_lease(cur), proj.script))
+            active = [s["task"] for s in proj.states() if s.get("status") in ACTIVE]
+            info("taking over the lease from %s, whose process has exited%s" % (
+                describe_lease(cur), ("; resume its tasks: " + ", ".join(active)) if active else ""))
+            cur = None
+        lease = cur or {"session": sid, "pid": pid, "host": socket.gethostname(), "user": getpass.getuser(),
+                        "acquired": now()}
+        lease.update(pid=pid or lease.get("pid"), renewed=now(), last_command=command)
+        tmp = lease_path(proj) + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(lease, f, indent=1, sort_keys=True)
+        os.replace(tmp, lease_path(proj))
+
+
+def cmd_lease(proj, args):
+    cur = read_lease(proj)
+    sid, _ = session_identity()
+    if args.action == "show":
+        if not cur:
+            print("no lease: the next command that changes tasks takes it")
+        else:
+            print("held by %s%s%s" % (describe_lease(cur), " (this session)" if cur.get("session") == sid else "",
+                                      "" if lease_holder_alive(cur) else " [process exited: free to take over]"))
+        return 0
+    with proj.lock():
+        cur = read_lease(proj)
+        if not cur:
+            print("no lease held")
+            return 0
+        if cur.get("session") != sid and not args.force:
+            raise Busy("the lease belongs to %s; pass --force only if that session is gone" % describe_lease(cur))
+        active = [s["task"] for s in proj.states() if s.get("status") in ACTIVE]
+        if active and not args.force:
+            die("tasks are still active (%s): another session taking over now would start duplicate agents. "
+                "Land or remove them first, or pass --force" % ", ".join(active))
+        os.remove(lease_path(proj))
+        print("released lease of %s" % describe_lease(cur))
+    return 0
 
 
 # ---------------------------------------------------------------- plan parsing
@@ -926,10 +1091,32 @@ def cmd_add(proj, args):
         info("WARN: %s is not in the plan; adding it anyway (ad-hoc task)" % task)
     repo = args.repo or proj.state(task).get("repo") or (row["repo"] if row else proj.primary)
     serial = bool(row) and row.get("parallel", "").strip().lower() in proj.cfg["plan"]["serial_values"]
-    if proj.state(task).get("status") not in ACTIVE:
-        full = capacity_problems(proj, task, repo, row, serial)
-        if full and not args.force:
-            die("not starting %s: %s. Start it after one lands, or pass --force if the user agreed" % (task, "; ".join(full)))
+    # Check capacity, allocate the slot and claim the task in one step under the state lock, before any git work,
+    # so parallel adds cannot both pass the limits or get the same slot/port/migration prefix.
+    with proj.lock():
+        fresh = proj.state(task).get("status") not in ACTIVE
+        if fresh:
+            full = capacity_problems(proj, task, repo, row, serial)
+            if full and not args.force:
+                die("not starting %s: %s. Start it after one lands, or pass --force if the user agreed" % (task, "; ".join(full)))
+            had_old = os.path.exists(proj.sfile(task))
+            if had_old:
+                os.replace(proj.sfile(task), proj.sfile(task) + ".old")
+            slot = alloc_slot(proj)
+            proj.save(task, task=task, status="running", started=now(), repo=repo, slot=slot, serial=serial,
+                      phase=row["phase"]["id"] if row else "", port=proj.cfg["slots"]["port_base"] + int(slot))
+    try:
+        add_worktree(proj, args, task, repo, row, serial)
+    except Fail:
+        if fresh:
+            with proj.lock():  # give the claim back
+                os.remove(proj.sfile(task))
+                if had_old:
+                    os.replace(proj.sfile(task) + ".old", proj.sfile(task))
+        raise
+
+
+def add_worktree(proj, args, task, repo, row, serial):
     root = proj.repo_root(repo)
     w = proj.rcfg(repo, "worktree")
     wt = os.path.join(root, w["dir"], norm_id(task))
@@ -945,14 +1132,7 @@ def cmd_add(proj, args):
     else:
         git(root, "worktree", "add", "-q", "--no-track", "-b", branch, wt, proj.base_ref())
     st = proj.state(task)
-    if st.get("status") in (None, "", "removed", "merged"):
-        if os.path.exists(proj.sfile(task)):
-            os.replace(proj.sfile(task), proj.sfile(task) + ".old")
-        st = proj.save(task, status="running", started=now())
-    slot = st.get("slot") or alloc_slot(proj)
-    proj.save(task, task=task, repo=repo, branch=branch, worktree=wt, slot=slot, serial=serial,
-              phase=row["phase"]["id"] if row else "",
-              port=proj.cfg["slots"]["port_base"] + int(slot), date=datetime.date.today().strftime("%Y_%m_%d"),
+    proj.save(task, branch=branch, worktree=wt, date=datetime.date.today().strftime("%Y_%m_%d"),
               base=st.get("base") or git(wt, "merge-base", proj.base_ref(), "HEAD"))
     c = proj.ctx(task, repo)
     prepare_wt(proj, repo, wt, c, "add")
@@ -1048,6 +1228,9 @@ def cmd_note(proj, args):
 
 
 def cmd_status(proj, args):
+    lease = read_lease(proj)
+    if lease:
+        print("orchestrator: %s%s" % (describe_lease(lease), "" if lease_holder_alive(lease) else " [exited]"))
     rows = []
     for st in proj.states():
         if st.get("status") in ("merged", "removed") and not args.all:
@@ -1717,6 +1900,11 @@ Land (orchestrator only, one task at a time)
   land <ID> "<message>"       commit with the progress edit and push (secondary repo: its commit, then a
                               primary progress commit with {sha} filled in). Resumable after a failed push
   abort                       drop a staged merge
+Sessions (one orchestrator per project at a time)
+  lease [show]                which session orchestrates this project
+  lease release [--force]     end this session's lease (--force: one whose session is gone)
+                              add/note/merge/land/abort/approve/mark/remove take or renew the lease; another
+                              live session's lease, or a merge queue in use, exits with code 3 (busy: retry)
   deploy-wait [SHA] [--repo]  follow the GitHub Actions deploy run for SHA (also through cancelled runs)
   smoke <ID>                  run the "## Smoke" lines of the task's report against smoke.base_url
   remove <ID> [--force]       teardown hooks, worktree, branch; refuses unmerged work without --force
@@ -1736,6 +1924,9 @@ def main(argv):
         print(HELP)
         return 0
     sub = argparse.ArgumentParser(prog="phase.py " + cmd)
+    if cmd == "lease":
+        sub.add_argument("action", nargs="?", default="show", choices=["show", "release"])
+        sub.add_argument("--force", action="store_true")
     if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove", "approve", "mark"):
         sub.add_argument("task")
     if cmd == "ready":
@@ -1775,7 +1966,7 @@ def main(argv):
         "doctor": cmd_doctor, "ready": cmd_ready, "brief": cmd_brief, "review-brief": cmd_review_brief,
         "add": cmd_add, "note": cmd_note, "status": cmd_status, "overlap": cmd_overlap, "sync": cmd_sync,
         "check": cmd_check, "merge": cmd_merge, "land": cmd_land, "abort": cmd_abort, "approve": cmd_approve,
-        "mark": cmd_mark,
+        "mark": cmd_mark, "lease": cmd_lease,
 
         "deploy-wait": cmd_deploy_wait, "smoke": cmd_smoke, "remove": cmd_remove,
     }
@@ -1783,12 +1974,20 @@ def main(argv):
         print("unknown command '%s'\n\n%s" % (cmd, HELP), file=sys.stderr)
         return 2
     proj = Project(a.project)
+    if cmd in LEASE_COMMANDS:
+        take_lease(proj, cmd)
+    if cmd in ("merge", "land", "mark", "abort"):
+        with proj.queue_lock():
+            return table[cmd](proj, args) or 0
     return table[cmd](proj, args) or 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
+    except Busy as e:
+        print("phase: busy: %s" % e, file=sys.stderr)
+        sys.exit(3)
     except Fail as e:
         print("phase: %s" % e, file=sys.stderr)
         sys.exit(1)
