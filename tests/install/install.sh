@@ -26,5 +26,8 @@ has "list" "$(I --list)" "skill +phase +\\[installed\\]"
 I --uninstall phase >/dev/null
 has "uninstall removes our links" "$(ls "$T/skills" "$T/agents")" "unrelated.md"
 has "uninstall leaves other files" "$(cat "$T/agents/unrelated.md")" "mine"
+has "partial uninstall keeps other plugins" "$(ls "$T/skills")" "^scope$"
+has "links scope too" "$(readlink "$T/skills/scope")" "plugins/scope/skills/scope$"
+I --uninstall >/dev/null
 has "nothing of ours left" "$(find "$T/skills" "$T/agents" -type l | wc -l | tr -d ' ')" "^0$"
 echo; echo "install test: $pass passed, $fail failed"; [ "$fail" -eq 0 ]

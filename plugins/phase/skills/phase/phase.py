@@ -50,6 +50,8 @@ DEFAULTS = {
         "manual_phases": r"no subagents|^ops\b",
         "serial_values": ["no"],
         "cap": r"max (\d+) agents?",
+        "format": "auto",
+        "blocked_by": "manual",
     },
     "slots": {"port_base": 8100, "avoid": None},
     "worktree": {
@@ -394,7 +396,8 @@ def parse_plan(text, pcfg, repos, primary):
         if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
             continue
         lower = [c.lower() for c in cells]
-        if header is None and any(c in want["id"] for c in lower):
+        # A task table has an id and a task column; tables like Decisions or Risks (ID | Statement | ...) are skipped.
+        if header is None and any(c in want["id"] for c in lower) and any(c in want["task"] for c in lower):
             header = {}
             for key, aliases in want.items():
                 for i, c in enumerate(lower):
@@ -418,6 +421,122 @@ def parse_plan(text, pcfg, repos, primary):
                     repo = name
         row["repo"] = repo
         tasks.append(row)
+    return tasks
+
+
+BLOCK_PHASE = re.compile(r"^###\s+(P\d+)\s*[—–-]\s*(.+?)\s*$")
+BLOCK_TASK = re.compile(r"^####\s+(T\d+(?:\.\d+)*)\s*[—–-]\s*(.+?)\s*$")
+BLOCK_FIELD = re.compile(r"^- \*\*(.+?):\*\*\s*(.*)$")
+BLOCK_STATUS = {"todo": "", "in-progress": "", "": ""}
+
+
+def is_block_plan(text):
+    return bool(re.search(r"^####\s+T\d+(?:\.\d+)*\s*[—–-]", text, re.M) and re.search(r"^- \*\*Status:\*\*", text, re.M))
+
+
+def plan_blockers(text):
+    """Open blockers in a scope-format plan: A<n> still `unconfirmed` in §6, CQ/TQ not marked answered in §7."""
+    open_ids = set()
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("|"):
+            cells = split_row(s)
+            if len(cells) >= 3 and re.fullmatch(r"A\d+", cells[0]) and cells[2].lower() == "unconfirmed":
+                open_ids.add(cells[0])
+        m = re.match(r"^(?:\d+\.|-)\s*\*\*((?:CQ|TQ)\d+)\*\*", s)
+        if m and "answered" not in s.lower():
+            open_ids.add(m.group(1))
+    return open_ids
+
+
+def parse_blocks(text, pcfg, repos, primary, plan_file):
+    """Plans written by the scope skill: `### P<n> — Name` phases with `#### T<p>.<n> — Title` task blocks."""
+    tasks, phase, cur, field = [], None, None, None
+    open_ids = plan_blockers(text)
+    in_fence = False
+
+    def finish():
+        if cur:
+            tasks.append(cur)
+
+    for line in text.splitlines():
+        s = line.rstrip()
+        if s.strip().startswith("```"):
+            in_fence = not in_fence
+            if not in_fence and field == "verify":
+                field = None  # the Verify block ended
+            continue
+        if in_fence:
+            if cur is not None and field == "verify" and s.strip() and not s.strip().startswith("#"):
+                cur["verify"].append(s.strip())
+            continue
+        if s.startswith("## "):
+            finish()
+            cur, phase, field = None, None, None
+            continue
+        m = BLOCK_PHASE.match(s)
+        if m:
+            finish()
+            cur, field = None, None
+            title = "%s — %s" % (m.group(1), m.group(2))
+            cap = re.search(pcfg["cap"], title, re.I) if pcfg.get("cap") else None
+            phase = {"id": m.group(1), "name": title, "repo": None, "text": title,
+                     "manual": bool(re.search(pcfg["manual_phases"], m.group(2).lower())) if pcfg.get("manual_phases") else False,
+                     "cap": int(cap.group(1)) if cap else None}
+            continue
+        m = BLOCK_TASK.match(s)
+        if m:
+            finish()
+            cur = {"id": m.group(1), "task": m.group(2), "deps": "", "status": "", "owner": "", "parallel": "",
+                   "phase": phase or {"id": "-", "name": "-", "repo": None, "manual": False, "cap": None, "text": ""},
+                   "spec": "the `#### %s` task block in %s (read §2–§6 of that file first)" % (m.group(1), plan_file),
+                   "criteria": [], "verify": [], "blocked_by": [], "raw_status": "", "goal": ""}
+            field = None
+            continue
+        if cur is None:
+            if phase is not None and s.strip():
+                phase["text"] += " " + s.strip()  # Goal / Exit criteria lines: repo markers may be here
+            continue
+        f = BLOCK_FIELD.match(s)
+        if f:
+            key, val = f.group(1).lower(), f.group(2).strip()
+            field = {"acceptance criteria": "criteria", "verify": "verify"}.get(key)
+            if key == "status":
+                cur["raw_status"] = val
+            elif key == "depends on":
+                cur["deps"] = val
+            elif key == "parallel":
+                cur["parallel"] = val
+            elif key == "owner":
+                cur["owner"] = val
+            elif key == "goal":
+                cur["goal"] = val
+            elif key == "blocked by":
+                cur["blocked_by"] = [x for x in re.findall(r"\b(?:A|CQ|TQ)\d+\b", val) if x in open_ids]
+            continue
+        if field == "criteria":
+            c = re.match(r"^\s*- \[[ xX]\]\s*(.+)$", s)
+            if c:
+                cur["criteria"].append(c.group(1).strip())
+    finish()
+
+    for t in tasks:
+        raw = t["raw_status"].strip("` ").lower()
+        first = raw.split()[0] if raw else ""
+        t["status"] = BLOCK_STATUS.get(first, t["raw_status"])
+        if first == "blocked":
+            t["plan_blocked"] = True
+            t["status"] = ""
+        t["done_when"] = "; ".join(t["criteria"])
+        repo = primary
+        for name, r in repos.items():
+            for marker in r.get("markers", []):
+                if marker and marker in t["phase"].get("text", ""):
+                    repo = name
+            for marker in r.get("row_markers", []):
+                if re.search(marker, t["task"] + " " + t["goal"]):
+                    repo = name
+        t["repo"] = repo
     return tasks
 
 
@@ -467,6 +586,10 @@ def classify(t, by_id, pcfg, proj):
     for marker in pcfg["manual_markers"]:
         if marker and marker in t["task"]:
             return "manual", "marked %s" % marker
+    if t.get("plan_blocked"):
+        return "manual", "Status is blocked in the plan"
+    if t.get("blocked_by") and pcfg.get("blocked_by", "manual") == "manual":
+        return "manual", "blocked by open %s (confirm in the plan, or plan.blocked_by: warn)" % ", ".join(t["blocked_by"])
     ids, gates = expand_deps(t["deps"])
     unknown = [i for i in ids if i not in by_id]
     if unknown:
@@ -480,7 +603,12 @@ def classify(t, by_id, pcfg, proj):
 
 
 def load_plan(proj):
-    tasks = parse_plan(proj.plan_text(), proj.cfg["plan"], proj.repos, proj.primary)
+    text = proj.plan_text()
+    fmt = proj.cfg["plan"].get("format", "auto")
+    if fmt == "blocks" or (fmt == "auto" and is_block_plan(text)):
+        tasks = parse_blocks(text, proj.cfg["plan"], proj.repos, proj.primary, proj.cfg["plan"]["file"])
+    else:
+        tasks = parse_plan(text, proj.cfg["plan"], proj.repos, proj.primary)
     if not tasks:
         die("no task rows found in %s (check plan.columns in phase.json)" % proj.cfg["plan"]["file"])
     return tasks, {t["id"]: t for t in tasks}
@@ -740,6 +868,8 @@ def cmd_ready(proj, args):
             flags.append("serial")
         if state == "ready" and t["phase"]["cap"]:
             flags.append("phase cap %d" % t["phase"]["cap"])
+        if state == "ready" and t.get("blocked_by"):
+            flags.append("assumes open " + ", ".join(t["blocked_by"]))
         title = re.sub(r"\s+", " ", t["task"])
         rows.append([t["id"], t["phase"]["id"], t["repo"], state, "; ".join([detail] + flags), title[:70]])
     print_table(["TASK", "PHASE", "REPO", "STATE", "DETAIL", "TITLE"], rows)
@@ -853,6 +983,12 @@ def cmd_brief(proj, args):
     if b["read"]:
         lines.append("Read first: %s" % ", ".join(proj.fmt(r, c) for r in b["read"]))
     lines.append("Done when: %s" % (proj.fmt(b["done_when"], c).strip() or "every acceptance point in the spec holds"))
+    if row.get("verify"):
+        lines.append("Verify (from the plan; run these too): " + " && ".join(row["verify"]))
+    if row.get("blocked_by"):
+        lines.append("Open assumptions/questions this task depends on: %s. Build for the plan's current assumption "
+                     "and say in the report what would change if it is rejected." % ", ".join(row["blocked_by"]))
+
     lines += [proj.fmt(e, c) for e in b["extra"]]
     if b["rules"]:
         lines += ["", "Project rules:"] + ["- " + proj.fmt(r, c) for r in b["rules"]]
@@ -1081,7 +1217,6 @@ def cmd_check(proj, args):
 
     for rule in g["rules"]:
         hits = [h for h in added_lines(wt, base, rule.get("paths"), rule.get("exclude"))
-
                 if re.search(rule["regex"], h[2])]
         msg = rule.get("message", rule.get("name", rule["regex"]))
         lines = ["%s:%d: %s" % (f, n, t.strip()[:140]) for f, n, t in hits[:20]]
@@ -1346,6 +1481,61 @@ def cmd_abort(proj, args):
             print("%s back to review" % st["task"])
 
 
+def mark_text(text, task, status, pcfg):
+    """Set a task's status in plan text (task block or table row). Returns the new text, or None if not found."""
+    lines = text.split("\n")
+    if is_block_plan(text):
+        i = next((k for k, l in enumerate(lines) if (BLOCK_TASK.match(l) or [None, None])[1] == task), None)
+        if i is None:
+            return None
+        crit = False
+        for k in range(i + 1, len(lines)):
+            l = lines[k]
+            if BLOCK_TASK.match(l) or BLOCK_PHASE.match(l) or l.startswith("## "):
+                break
+            if l.startswith("- **Status:**"):
+                lines[k] = "- **Status:** " + status
+            f = BLOCK_FIELD.match(l)
+            if f:
+                crit = f.group(1).lower() == "acceptance criteria"
+            elif crit and re.match(r"^\s*- \[ \]", l) and re.match(pcfg["done"], status, re.I):
+                lines[k] = l.replace("- [ ]", "- [x]", 1)
+        return "\n".join(lines)
+    want = {k: [a.lower() for a in v] for k, v in pcfg["columns"].items()}
+    header = None
+    for k, l in enumerate(lines):
+        s = l.strip()
+        if not s.startswith("|"):
+            header = None
+            continue
+        cells = split_row(s)
+        lower = [c.lower() for c in cells]
+        if header is None and any(c in want["id"] for c in lower) and any(c in want["task"] for c in lower):
+            header = {key: next((n for n, c in enumerate(lower) if c in al), None) for key, al in want.items()}
+            continue
+        if header and header.get("id") is not None and header.get("status") is not None \
+                and len(cells) > header["status"] and cells[header["id"]].strip("`* ") == task:
+            cells[header["status"]] = status
+            lines[k] = "| " + " | ".join(cells) + " |"
+            return "\n".join(lines)
+    return None
+
+
+def cmd_mark(proj, args):
+    st = proj.state(args.task)
+    task = st.get("task") or args.task
+    if st.get("status") not in ("merging",):
+        die("%s is not staged for landing (status %s); mark it between merge and land" % (task, st.get("status", "-")))
+    path = os.path.join(proj.int_wt(proj.primary), proj.cfg["plan"]["file"])
+    status = args.status or ("done" if is_block_plan(open(path, encoding="utf-8").read())
+                             else "done " + datetime.date.today().isoformat())
+    new = mark_text(open(path, encoding="utf-8").read(), task, status, proj.cfg["plan"])
+    if new is None:
+        die("%s not found in %s" % (task, path))
+    open(path, "w", encoding="utf-8").write(new)
+    print("%s: status set to '%s' in %s" % (task, status, path))
+
+
 def cmd_approve(proj, args):
     st = proj.state(args.task)
     if not st:
@@ -1520,6 +1710,8 @@ Work
   check <ID> [--quick]        the gate: forbidden/owned/immutable files, rules, secrets, tests changed, skip
                               markers, per-file checks, test commands
   approve <ID> [--note TEXT]  record that a required review approved the current tip (merge needs it)
+  mark <ID> [STATUS]          after merge: set the task's status in the plan (block Status line, ticks its
+                              criteria; or the table's status cell). Default "done" / "done <date>"
 Land (orchestrator only, one task at a time)
   merge <ID>                  squash onto a fresh base in <worktrees>/_integration and run the checks
   land <ID> "<message>"       commit with the progress edit and push (secondary repo: its commit, then a
@@ -1544,7 +1736,7 @@ def main(argv):
         print(HELP)
         return 0
     sub = argparse.ArgumentParser(prog="phase.py " + cmd)
-    if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove", "approve"):
+    if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove", "approve", "mark"):
         sub.add_argument("task")
     if cmd == "ready":
         sub.add_argument("scope", nargs="*")
@@ -1554,6 +1746,8 @@ def main(argv):
         sub.add_argument("repo_pos", nargs="?")
         sub.add_argument("--repo")
         sub.add_argument("--force", action="store_true")
+    if cmd == "mark":
+        sub.add_argument("status", nargs="?")
     if cmd == "approve":
         sub.add_argument("--note")
     if cmd == "note":
@@ -1581,6 +1775,7 @@ def main(argv):
         "doctor": cmd_doctor, "ready": cmd_ready, "brief": cmd_brief, "review-brief": cmd_review_brief,
         "add": cmd_add, "note": cmd_note, "status": cmd_status, "overlap": cmd_overlap, "sync": cmd_sync,
         "check": cmd_check, "merge": cmd_merge, "land": cmd_land, "abort": cmd_abort, "approve": cmd_approve,
+        "mark": cmd_mark,
 
         "deploy-wait": cmd_deploy_wait, "smoke": cmd_smoke, "remove": cmd_remove,
     }

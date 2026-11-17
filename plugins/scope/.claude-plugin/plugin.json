@@ -1,0 +1,7 @@
+{
+  "name": "scope",
+  "version": "1.0.0",
+  "description": "Turn any brief into a standardized, validated, phased execution plan for coding agents (tasks with IDs, dependencies, acceptance criteria, verify commands) plus client questions. /phase runs the plan.",
+  "author": { "name": "batsoyombo-dev" },
+  "keywords": ["planning", "spec", "tasks", "roadmap"]
+}

@@ -4,6 +4,7 @@ Our Claude Code skills and agents, in one place, installable on any machine with
 
 | Plugin | What it gives you |
 |---|---|
+| [`scope`](plugins/scope/skills/scope/SKILL.md) | `/scope <brief>`: turns a brief, feature idea or bug report into a validated phased plan (`docs/plans/<id>.md`): tasks with IDs, dependencies, acceptance criteria and verify commands, marked assumptions, and client questions ready to forward. `/phase` runs the plan directly. |
 | [`phase`](plugins/phase/skills/phase/SKILL.md) | `/phase`: runs a project's plan tasks in parallel. One git worktree, environment and implementer agent per task; a deterministic gate; an independent reviewer; a serial merge queue onto the base branch (squash, full checks, progress file in the same commit, push, deploy watch, smoke). Project-agnostic: each repo describes itself in `.claude/phase.json` ([reference](plugins/phase/skills/phase/reference.md)). Agents: `phase-implementer`, `phase-reviewer`. |
 
 ## Install
@@ -55,6 +56,8 @@ Plugins are copied into Claude Code's cache, and their names get a prefix (`/pha
 ```
 
 Then ask Claude to "run phase P0" (or `/phase P0`). Commit `.claude/phase.json` with the repo.
+
+No plan yet? `/scope <brief>` writes one in `docs/plans/`; point `plan.file` and `land.progress_file` at it.
 
 ## Develop
 

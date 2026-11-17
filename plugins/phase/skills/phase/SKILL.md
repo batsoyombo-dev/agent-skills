@@ -36,9 +36,13 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
 
 ## 1. Pick the tasks
 
+- The plan is a progress file with task tables, or a plan written by the `scope` skill (read directly). No plan yet: write one with `/scope` first.
 - `$P ready [scope]` lists each task with a state:
+
   - `ready`, `blocked` (with what it waits on), `manual`, `running`, `done`
   - `partial`: has status text but isn't done. Read the text; the rest is usually a deploy or user step.
+  - `manual` with "blocked by open A3, CQ2" (scope plans): the task waits on a client or team answer. Name the question for the user; once it is answered or the assumption confirmed in the plan, the task becomes ready.
+
   - flags: `serial` (the plan says it can't run in parallel) and phase caps
 - Scope: phase ids, task ids or `all`. With no argument, take the first phase with a ready task.
 - Read the project rules (`brief.read` in phase.json) and each candidate's spec before starting it.
@@ -93,7 +97,7 @@ $P merge <ID>      # squash onto a fresh base in <worktrees>/_integration and ru
 
 When merge says ok, edit the progress file **in the integration worktree** (the path is printed):
 
-- Set the task's status to done, with the date. Use a partial status when deploy or user steps remain.
+- Set the task's status: `$P mark <ID>` (done, with the date for table plans; for a `scope` plan it sets `Status: done` and ticks the criteria). Pass a status (`$P mark <ID> "deployed; smoke pending"`) when deploy or user steps remain.
 - Add a line to the done log.
 - Under open items: every deploy step from the report (config with production and staging values, migrations, jobs, packages, one-off commands) and every user ask.
 - Other plan-doc notes may go in the same commit; land refuses anything outside `land.allow_after_merge`.

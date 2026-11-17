@@ -38,6 +38,8 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `plan.manual_phases` | regex on a phase heading that makes the whole phase manual (default `no subagents\|^ops\b`) |
 | `plan.serial_values` | `parallel` column values that mean "run alone" (default `no`) |
 | `plan.cap` | regex on a phase heading giving a per-phase agent cap (default `max (\d+) agents?`) |
+| `plan.format` | `auto` (default), `table` or `blocks`. `blocks` = a plan written by the `scope` skill; `auto` detects it |
+| `plan.blocked_by` | scope plans: `manual` (default) holds a task whose **Blocked by** names an `A<n>` still `unconfirmed` or a `CQ`/`TQ` not marked answered; `warn` starts it anyway and puts the open items in the brief |
 | `repos` | `{name: {path, primary, env, clone, markers, row_markers, max_agents, worktree, gate, deploy, brief, review}}`. The primary repo holds the plan, the state and the progress file. `env` names an environment variable that overrides `path`; `clone` is a URL for the error message. `markers` are strings in a phase heading, and `row_markers` regexes on a task row, that send tasks to this repo. Per-repo sections override the top-level ones. |
 | `slots.port_base` | default 8100; the integration worktree gets `port_base - 1` |
 | `slots.avoid` | `{repo, path, regex}`: treat slots already used today under `path` as taken (regex with `{date}`, group 1 = slot), e.g. migration names |
@@ -78,7 +80,12 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `doctor.require` | tools that must exist (placeholders allowed) |
 | `doctor.checks` | `[{name, run}]` commands that must exit 0 (database reachable, infra up) |
 
-## Plan format
+## Scope plans (task blocks)
+
+Plans from the `scope` skill are read directly: `### P<n> — Name` phases, `#### T<p>.<n> — Title` task blocks with `- **Status:**`, `**Depends on:**`, `**Parallel:**`, `**Blocked by:**`, `**Acceptance criteria:**` and `**Verify:**`. `todo` and `in-progress` mean not started, `done` is done, `blocked` is manual. The brief points the implementer at the task block, uses the acceptance criteria as done-when and lists the Verify commands. Set `plan.file` and `land.progress_file` to the plan; after `merge`, `phase.py mark <ID>` sets `Status: done` and ticks the criteria. Repo markers are matched against the phase heading and its Goal/Exit lines, row markers against the task title and Goal.
+
+## Plan format (tables)
+
 
 Markdown tables under phase headings, either `**P0: Name**` or `## P0: Name` (text after the bold title, such as "(max 2 agents)", feeds `cap`, `manual_phases` and the repo markers). The first row whose cell matches `columns.id` is the header. Dependencies are separated by `,`, `;` or `+`. Ranges expand: `A1–A4`, `T0.1-T0.3`, `E2a–E2e`. Any other word ("adoption") makes the task `manual` with a "gated on" note. Status text that isn't done makes the task `partial`.
 

@@ -252,7 +252,8 @@ P add T0.1 >/dev/null; ( cd .worktrees/t0_1 && echo x > x.txt && git add -A && g
 has "a serial task runs alone" "$(P add T0.2)" "T0.1 is serial and still active"
 
 P check T0.1 >/dev/null; P merge T0.1 >/dev/null
-edit 's/\| T0.1 \| One \| — \| no \| agent \| \|/| T0.1 | One | — | no | agent | done 2026-11-17 |/' .worktrees/_integration/docs/progress.md
+has "mark sets the table status cell" "$(P mark T0.1)" "status set to 'done 20[0-9-]+'"
+has "only T0.1's row changed" "$(grep -c '| done 20' .worktrees/_integration/docs/progress.md)" "^1$"
 has "land fast-forwards the local base" "$(P land T0.1 'T0.1: x')" "landed T0.1"
 has "checked-out base moved and is clean" "$(git status --porcelain | wc -l | tr -d ' ') $(ls x.txt 2>/dev/null)" "^0 x.txt$"
 has "T0.2 ready after T0.1" "$(P ready)" "T0.2 .*ready"
