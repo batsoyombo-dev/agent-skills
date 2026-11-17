@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# End-to-end test of plugins/phase: builds throwaway repos with local bare remotes (nothing leaves the machine)
+# and walks the whole flow: doctor, ready, add, isolation, brief, gate, overlap, merge, land, conflicts,
+# a secondary repo, smoke, remove, resume and local-only mode. Exit 0 = all passed.
+# Needs git, python3, bash. Run: tests/phase/e2e.sh   (KEEP=1 keeps the temp dir for inspection)
+set -uo pipefail
+
+ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+PHASE="$ROOT/plugins/phase/skills/phase/phase.py"
+T=$(mktemp -d "${TMPDIR:-/tmp}/phase-e2e.XXXXXX")
+export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_EDITOR=true
+pass=0; fail=0
+SERVER=""
+cleanup() { [ -n "$SERVER" ] && { kill "$SERVER" 2>/dev/null; wait "$SERVER" 2>/dev/null; }; [ -n "${KEEP:-}" ] && echo "kept $T" || rm -rf "$T"; }
+PORT=$((20000 + RANDOM % 20000))
+trap cleanup EXIT
+
+ok()   { pass=$((pass + 1)); echo "  ok    $1"; }
+bad()  { fail=$((fail + 1)); echo "  FAIL  $1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/        | /' | head -30; }
+has()  { if printf '%s' "$2" | grep -qE -- "$3"; then ok "$1"; else bad "$1 (expected /$3/)" "$2"; fi; }
+hasnt(){ if printf '%s' "$2" | grep -qE -- "$3"; then bad "$1 (unexpected /$3/)" "$2"; else ok "$1"; fi; }
+P()    { python3 "$PHASE" "$@" 2>&1; }
+edit() { perl -pi -e "$1" "$2"; }   # portable in-place edit (BSD and GNU)
+
+echo "phase e2e in $T"
+cd "$T"
+for r in proj app; do git init -q --bare "$r-origin.git"; git init -q -b staging "$r"; git -C "$r" remote add origin "$T/$r-origin.git"; done
+
+# ---------------------------------------------------------------- fixture
+cd "$T/proj"
+mkdir -p docs/plan src migrations .claude
+cat > docs/plan/progress.md <<'EOF'
+# Progress
+
+## Phases
+
+**A: core**
+
+| Id | Task | Depends on | Owner | Status |
+|---|---|---|---|---|
+| A1 | Add greeting | — | agent | |
+| A2 | Add farewell | — | agent | |
+| A3 | Use both | A1, A2 | agent | |
+| A4 | Ask the client | — | you | |
+
+**B: app** (`app` repo)
+
+| Id | Task | Depends on | Owner | Status |
+|---|---|---|---|---|
+| B1 | App screen | A1 | agent | |
+EOF
+printf 'greet() { echo hi; }\n' > src/lib.sh
+printf 'one\n' > routes.txt
+printf 'create table t (id int);\n' > migrations/2026_01_01_100000_init.sql
+cat > test.sh <<'EOF'
+set -e
+for f in src/*.sh; do bash -n "$f"; done
+grep -q '^DB_NAME=db_' .env || { echo "worktree env not isolated"; exit 1; }
+EOF
+printf '.env\n' > .gitignore
+printf 'DB_NAME=shared\nSECRET=real\n' > .env
+cat > .claude/phase.json <<EOF
+{
+  "project": "the demo plan",
+  "plan": { "file": "docs/plan/progress.md" },
+  "repos": {
+    "core": { "path": ".", "primary": true },
+    "app": { "path": "../app", "markers": ["\`app\` repo"],
+             "worktree": { "env_file": "", "setup": ["echo app-\$PHASE_ACTION > .setup-marker"] },
+             "gate": { "tests": ["test -f screen.txt"] } }
+  },
+  "slots": { "vars": { "migration_prefix": "{date}_{slot}00" },
+             "avoid": { "path": "migrations", "regex": "^{date}_(\\\\d\\\\d)" } },
+  "worktree": {
+    "env_file": ".env",
+    "env": { "DB_NAME": "db_{id}", "PORT": "{port}", "SECRET": "" },
+    "setup": ["echo setup-\$PHASE_ACTION-{id} > .setup-marker"],
+    "teardown": ["echo teardown \$PHASE_ID >> $T/teardown.log"],
+    "exclude": [".setup-marker"]
+  },
+  "gate": {
+    "tests": ["bash test.sh"],
+    "per_file": [{ "glob": "*.sh", "run": "bash -n {file}", "name": "bash -n on changed scripts" }],
+    "immutable": ["migrations/*"],
+    "rules": [
+      { "name": "no xtrace", "regex": "set -x", "paths": ["src/*"], "level": "fail", "message": "set -x leaks secrets" },
+      { "name": "no TODO", "regex": "TODO", "paths": ["src/*"], "level": "warn" }
+    ],
+    "review": { "lines": 400, "triggers": [{ "name": "schema", "paths": "^migrations/" }] }
+  },
+  "land": { "progress_file": "docs/plan/progress.md" },
+  "smoke": { "base_url": "http://127.0.0.1:$PORT" },
+  "brief": { "spec": "the {ID} row in docs/plan/progress.md", "read": ["README.md"],
+             "rules": ["Shell only."], "extra": ["Migrations: name new files {migration_prefix}01_<name>.sql"] },
+  "doctor": { "require": ["git", "bash"], "checks": [{ "name": "bash works", "run": "true" }] }
+}
+EOF
+git add -A && git commit -qm init && git push -q origin staging
+(cd "$T/app" && echo app > README && git add -A && git commit -qm init && git push -q origin staging)
+
+# ---------------------------------------------------------------- plan
+echo "plan"
+out=$(P doctor); has "doctor clean" "$out" "check bash works"; hasnt "doctor has no FAIL" "$out" "^FAIL"
+out=$(P ready)
+has "A1 ready" "$out" "A1 +A +core +ready"
+has "A3 blocked on A1,A2" "$out" "A3 .*blocked +waits on A1,A2"
+has "A4 manual (owner you)" "$out" "A4 .*manual +owner you"
+has "B1 routed to the app repo" "$out" "B1 +B +app +blocked"
+
+# ---------------------------------------------------------------- add, isolation, brief
+echo "add"
+P add A1 >/dev/null; P add a2 >/dev/null
+env1=$(cat .worktrees/a1/.env)
+has "own database per worktree" "$env1" "^DB_NAME=db_a1"
+has "secret blanked" "$env1" "^SECRET=$"
+has "setup hook ran" "$(cat .worktrees/a1/.setup-marker)" "setup-add-a1"
+has "worktree files are excluded" "$(git -C .worktrees/a1 status --porcelain | wc -l | tr -d ' ')" "^0$"
+out=$(P brief A1)
+has "brief has the gate command" "$out" "check A1"
+has "brief has project rules" "$out" "Shell only"
+has "brief renders slot vars" "$out" "Migrations: name new files [0-9_]+00"
+has "brief fills done-when" "$out" "Done when: every acceptance point"
+
+# ---------------------------------------------------------------- gate catches violations
+echo "gate"
+( cd .worktrees/a1
+  printf 'set -x\nhello() { greet; } # TODO\n' > src/hello.sh
+  echo edit >> migrations/2026_01_01_100000_init.sql
+  echo x >> docs/plan/progress.md
+  echo a1 >> routes.txt
+  printf 'AKIA%s\n' ABCDEFGHIJKLMNOP > src/key.txt
+  printf 'X=1\n' > .env.local
+  git add -A && git commit -qm "A1: greeting" )
+out=$(P check A1)
+has "forbidden file" "$out" "FAIL  must not be committed: .env.local"
+has "owned progress file" "$out" "FAIL  docs/plan/progress.md is the orchestrator's"
+has "immutable migration" "$out" "FAIL  existing file under an immutable path"
+has "fail rule" "$out" "FAIL  set -x leaks secrets"
+has "warn rule" "$out" "warn  no TODO"
+has "secret scan" "$out" "FAIL  secret-looking values"
+has "review trigger" "$out" "review required \\(schema\\)"
+has "gate fails" "$out" "RESULT: FAIL"
+
+( cd .worktrees/a1
+  git rm -q --cached .env.local; rm -f .env.local src/key.txt
+  git checkout -q origin/staging -- docs/plan/progress.md migrations/2026_01_01_100000_init.sql
+  printf 'hello() { greet; }\n' > src/hello.sh
+  printf '# A1 report\n## Smoke\n- `GET /index.html` → 200\n- `GET /missing` → 404\n' > .phase-report.md
+  git add -A && git commit -qm "A1: fixes" )
+( cd .worktrees/a2
+  echo a2 >> routes.txt; printf 'bye() { echo bye; }\n' > src/bye.sh
+  printf 'alter table t add c int;\n' > migrations/2026_11_17_110001_add_c.sql
+  git add -A && git commit -qm "A2: farewell" )
+has "gate passes after fixes" "$(P check A1)" "RESULT: PASS"
+has "overlap sees the shared file" "$(P overlap)" "core:routes.txt +A1, A2"
+P note A1 agent=agent-a1 >/dev/null
+has "status shows agent and gate" "$(P status)" "A1 +core +running +agent-a1 .* pass"
+
+# ---------------------------------------------------------------- merge queue
+echo "merge queue"
+has "merge refuses an ungated tip" "$(P merge A2)" "gate has not passed"
+has "merge A1" "$(P merge A1)" "^ok +squash of phase/a1"
+has "land needs the progress edit" "$(P land A1 'A1: greeting')" "unchanged .* update it first"
+edit 's/^\| A1 \| Add greeting \| — \| agent \| \|$/| A1 | Add greeting | — | agent | done 2026-11-17 |/' .worktrees/_integration/docs/plan/progress.md
+echo untested > .worktrees/_integration/src/sneaky.sh
+has "land refuses an untracked untested file" "$(P land A1 'A1: greeting')" "untested\\): src/sneaky.sh"
+rm .worktrees/_integration/src/sneaky.sh
+has "land A1" "$(P land A1 "$(printf 'A1: greeting\n\nCo-Authored-By: t <t@example.invalid>')")" "landed A1"
+stat=$(git -C "$T/proj-origin.git" show --stat --format=%s staging)
+has "one squash commit with code and progress" "$stat" "docs/plan/progress.md"
+hasnt "nothing untested landed" "$stat" "sneaky"
+has "rolling: A3 now waits only on A2" "$(P ready A)" "A3 .*blocked +waits on A2 "
+
+has "gate passes for A2 alone" "$(P check A2)" "RESULT: PASS"
+has "squash conflict detected" "$(P merge A2)" "CONFLICT squashing phase/a2"
+has "sync --keep leaves the rebase" "$(P sync A2 --keep)" "left in progress"
+( cd .worktrees/a2 && printf 'one\na1\na2\n' > routes.txt && git add routes.txt && git rebase --continue >/dev/null 2>&1 )
+has "stale gate after rebase" "$(P merge A2)" "gate has not passed"
+P check A2 >/dev/null; has "merge A2" "$(P merge A2)" "^ok"
+edit 's/^\| A2 \| Add farewell \| — \| agent \| \|$/| A2 | Add farewell | — | agent | done 2026-11-17 |/' .worktrees/_integration/docs/plan/progress.md
+has "land A2" "$(P land A2 'A2: farewell')" "landed A2"
+
+# ---------------------------------------------------------------- secondary repo
+echo "secondary repo"
+has "B1 ready once A1 is done" "$(P ready all)" "B1 +B +app +ready"
+P add B1 >/dev/null
+has "app setup hook" "$(cat "$T/app/.worktrees/b1/.setup-marker")" "app-add"
+( cd "$T/app/.worktrees/b1" && echo screen > screen.txt && git add -A && git commit -qm "B1: screen" )
+P check B1 >/dev/null; has "merge B1" "$(P merge B1)" "write \\{sha\\}"
+edit 's/^\| B1 \| App screen \| A1 \| agent \| \|$/| B1 | App screen | A1 | agent | done 2026-11-17 (app `{sha}`) |/' .worktrees/_integration/docs/plan/progress.md
+has "land B1 in both repos" "$(P land B1 'B1: app screen')" "landed B1: core [0-9a-f]+, app [0-9a-f]+"
+appsha=$(git -C "$T/app-origin.git" rev-parse --short=7 staging)
+has "progress row carries the app sha" "$(git -C "$T/proj-origin.git" show staging:docs/plan/progress.md)" "app \`$appsha\`"
+has "primary progress commit subject" "$(git -C "$T/proj-origin.git" log -1 --format=%s staging)" "^B1: progress \\(app $appsha\\)"
+
+# ---------------------------------------------------------------- smoke
+echo "smoke"
+mkdir -p "$T/www" && echo ok > "$T/www/index.html"
+python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$T/www" >/dev/null 2>&1 &
+SERVER=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do python3 -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:$PORT/index.html')" 2>/dev/null && break; sleep 0.3; done
+out=$(P smoke A1)
+has "smoke 200" "$out" "ok +GET /index.html -> 200"
+has "smoke 404" "$out" "ok +GET /missing -> 404"
+has "smoke summary" "$out" "smoke: 2 checked, 0 failed"
+
+# ---------------------------------------------------------------- remove and resume
+echo "remove and resume"
+P add A3 >/dev/null; ( cd .worktrees/a3 && echo wip > src/wip.sh && git add -A && git commit -qm wip )
+has "remove refuses unmerged work" "$(P remove A3)" "unmerged commits"
+rm -rf .worktrees/a3
+has "add resumes the existing branch" "$(P add A3)" "resumed existing branch phase/a3"
+has "resumed branch keeps its commit" "$(git -C .worktrees/a3 log -1 --format=%s)" "^wip$"
+for t in A1 A2 B1; do P remove $t >/dev/null; done; P remove A3 --force >/dev/null
+has "teardown hooks ran" "$(cat "$T/teardown.log")" "teardown b1"
+has "no task branches left" "$(git branch --list 'phase/*' | wc -l | tr -d ' ')" "^0$"
+has "status --all keeps history" "$(P status --all)" "A1 +core +merged"
+
+# ---------------------------------------------------------------- local-only mode
+echo "local-only mode"
+git init -q -b staging "$T/loc" && cd "$T/loc" && mkdir -p docs .claude
+printf '**P0: Base**\n\n| Id | Task | Depends on | Parallel | Owner | Status |\n|---|---|---|---|---|---|\n| T0.1 | One | — | no | agent | |\n| T0.2 | Two | T0.1 | yes | agent | |\n' > docs/progress.md
+printf 'true\n' > t.sh
+printf '{"remote": null, "plan": {"file": "docs/progress.md"}, "worktree": {"env_file": ""}, "gate": {"tests": ["bash t.sh"]}, "land": {"progress_file": "docs/progress.md"}}' > .claude/phase.json
+git add -A && git commit -qm init
+has "serial flag and dotted ids" "$(P ready)" "T0.1 +P0 +main +ready +no deps; serial"
+P add T0.1 >/dev/null; ( cd .worktrees/t0_1 && echo x > x.txt && git add -A && git commit -qm "T0.1: x" )
+P check T0.1 >/dev/null; P merge T0.1 >/dev/null
+edit 's/\| T0.1 \| One \| — \| no \| agent \| \|/| T0.1 | One | — | no | agent | done 2026-11-17 |/' .worktrees/_integration/docs/progress.md
+has "land fast-forwards the local base" "$(P land T0.1 'T0.1: x')" "landed T0.1"
+has "checked-out base moved and is clean" "$(git status --porcelain | wc -l | tr -d ' ') $(ls x.txt 2>/dev/null)" "^0 x.txt$"
+has "T0.2 ready after T0.1" "$(P ready)" "T0.2 .*ready"
+
+echo
+echo "phase e2e: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

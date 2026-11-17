@@ -1,0 +1,61 @@
+{
+  "project": "the <name> plan",
+  "base": "staging",
+  "remote": "origin",
+  "vars": {},
+  "agents": { "max": 4 },
+  "plan": {
+    "file": "docs/plan/progress.md",
+    "columns": {
+      "id": ["id"],
+      "task": ["task"],
+      "deps": ["depends on"],
+      "status": ["status"],
+      "owner": ["owner"],
+      "spec": ["spec"],
+      "done_when": ["done when"],
+      "parallel": ["parallel"]
+    },
+    "agent_owners": ["agent", ""],
+    "manual_markers": ["`you`"]
+  },
+  "repos": {
+    "main": { "path": ".", "primary": true }
+  },
+  "worktree": {
+    "dir": ".worktrees",
+    "env_file": ".env",
+    "env_fallback": ".env.example",
+    "env": { "APP_URL": "http://127.0.0.1:{port}" },
+    "clone": [],
+    "link": [],
+    "setup": [],
+    "refresh": [],
+    "teardown": []
+  },
+  "gate": {
+    "tests": ["<the command that must pass before merge, e.g. bun run verify>"],
+    "conditional": [],
+    "per_file": [],
+    "immutable": [],
+    "rules": [
+      { "name": "no debug leftovers", "regex": "\\b(console\\.log|debugger)\\b", "paths": ["src/*"], "level": "warn" }
+    ],
+    "review": { "lines": 400, "triggers": [] }
+  },
+  "land": {
+    "progress_file": "docs/plan/progress.md",
+    "allow_after_merge": ["docs/*"]
+  },
+  "deploy": null,
+  "smoke": null,
+  "brief": {
+    "spec": "{spec}",
+    "done_when": "{done_when}",
+    "read": ["AGENTS.md"],
+    "rules": [],
+    "extra": []
+  },
+  "review": { "checklist": [] },
+  "doctor": { "require": ["git"], "checks": [] }
+}
