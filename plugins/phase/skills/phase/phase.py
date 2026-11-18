@@ -1418,7 +1418,7 @@ def cmd_check(proj, args):
                 cmd = proj.fmt(pf["run"], dict(c, file=shlex.quote(p)))
                 r = run(cmd, cwd=wt, shell=True, check=False)
                 if r.returncode != 0:
-                    errs.append("%s: %s" % (p, (r.stdout + r.stderr).strip().splitlines()[-1:] or ["failed"])[0][:160])
+                    errs.append("%s: %s" % (p, ((r.stdout + r.stderr).strip().splitlines()[-1:] or ["failed"])[0][:160]))
         name = pf.get("name", pf["run"])
         F(name, errs) if errs else P(name)
 
