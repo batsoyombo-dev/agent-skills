@@ -26,14 +26,16 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
 
 ## 0. Preflight and resume (every run)
 
-1. `$P doctor`. A FAIL stops work on that repo: tell the user the printed fix.
+1. **Fresh session.** Every orchestrator turn re-reads the whole conversation. If this conversation already holds other work (a redesign, screenshots, long debugging), each turn of the run gets slow. In that case tell the user to `/clear` and run `/phase` again before starting anything. State lives in `.phase/`, so nothing is lost.
+2. `$P doctor`. A FAIL stops work on that repo: tell the user the printed fix.
+   - A `permissions:` warning means agents will stop on approval prompts and wait for the user, often for minutes per command. Show the printed rules and, with the user's OK, add them to `.claude/settings.local.json` before you start agents. Skip this only when the session runs in auto mode.
    - **One orchestrator per project.** The first command that changes tasks takes this session's lease. Exit code **3** (`busy:`) means another live session orchestrates the project, or the merge queue is in use: tell the user who (the message says) and stop; headless, just exit. Never `lease release --force` a session that may still be running: its agents would be duplicated. A lease whose Claude process has exited is taken over automatically, and its active tasks are named so you can resume them.
-2. `$P status`: tasks from earlier sessions. State lives in `<worktrees>/.phase/`, so it survives compaction and new sessions.
+3. `$P status`: tasks from earlier sessions. State lives in `<worktrees>/.phase/`, so it survives compaction and new sessions.
    - `merging`: run `$P land` if the progress file was already edited in the integration worktree, otherwise `$P abort` and merge again.
    - `landing`: a land stopped after a commit or push (it prints the step). Run `$P land <ID> "<same message>"` again; it continues from that step. Never abort it: part of it may already be pushed.
    - `running` or `review` with an agent id: if that agent is alive in this session, wait for it. If not, run `$P check <ID> --quick`. With commits on the branch, review them and start a new implementer whose prompt says "continue: the branch already has N commits" plus the gate output. With no commits, start fresh.
    - Orphan `phase/*` branches: inspect them, then adopt with `$P add <ID>` or delete them.
-3. `$P overlap` when anything is active.
+4. `$P overlap` when anything is active.
 
 ## 1. Pick the tasks
 
@@ -85,7 +87,7 @@ The agents run in the background and you are notified as each finishes. Don't po
    - Minors you may record and skip.
    - Then record it: `$P approve <ID> --note "<reviewer APPROVE, or which findings you verified fixed>"`. Merge refuses a required review without an approval for the current tip, so a new commit needs a new approval.
 
-4. Check anything the gate can't, such as device or browser behaviour the spec asks for, the way the project rules say.
+4. No browser, device or visual checks during the run, by you or by any agent: they stall the queue. Collect the screens each task changed (from the reports' "Needs the user") into the final summary, for the user to look at.
 
 ## 4. Merge queue (one task at a time, in finishing order)
 
@@ -126,6 +128,7 @@ Finish with a short summary:
 - tasks landed (commit shas)
 - deploy and smoke results
 - decisions made
+- screens the tasks changed, for the user to look at (nothing was checked in a browser)
 - what the user must do, as exact commands or console steps, with staging and production separated
 - tasks still blocked and what unblocks them
 - the next command

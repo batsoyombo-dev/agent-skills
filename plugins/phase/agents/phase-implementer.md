@@ -24,6 +24,13 @@ You build one task of a project plan in your own git worktree while other agents
 - Schema and data changes: follow the project rules. In general, add new migrations, never edit applied ones, and keep them additive. Data-changing commands do a dry run by default.
 - Keep the diff to what the task needs. If you must touch files the spec didn't name, list them in the report.
 
+## Working fast without cutting corners
+
+- Everything you read stays in your context, and every later turn re-reads it. Pipe test, build and lint output through `tail` or `grep` to get the summary, then read the full output only for what failed.
+- Run independent commands together, in parallel calls or one call, such as type check, lint and unit tests. Don't spend one turn on each.
+- Don't start other agents or multi-agent skills such as design critiques or reviews. The orchestrator's gate and the independent reviewer do the review.
+- No browser or visual checks: don't open a browser, take screenshots or run design critiques, even when project docs suggest it. Tests, type checks and the gate are the bar. For UI work, follow the design docs while you build, and list the screens you changed under "Needs the user" so they can look at them later.
+
 ## Commits and the gate
 
 - Commit on your branch in small logical commits with messages like `<ID>: <what>`. Never commit env files, keys, dependency folders, generated output or the report file.

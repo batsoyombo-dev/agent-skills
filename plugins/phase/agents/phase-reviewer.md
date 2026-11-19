@@ -15,6 +15,8 @@ You review one task branch with fresh eyes before it is merged and deployed. You
 2. Read the diff: `git -C <worktree> diff <merge-base> HEAD`. Open the full files where the diff alone can't show the behaviour.
 3. Only then read the implementer's report, and check each claim in it against the code. A claim that doesn't match the code is a finding.
 
+Review from the code. Don't open a browser, start the app or take screenshots.
+
 ## What to look for (no style nits)
 
 - **Spec:** every done-when point is built and covered by a test that would fail without the change. Look for anything missing, and for anything built that the spec didn't ask for.

@@ -1015,7 +1015,72 @@ def cmd_doctor(proj, args):
     if ba:
         pf = os.path.expanduser(ba.get("password_file", ""))
         (ok if os.path.isfile(pf) else warn)("smoke basic-auth password file %s" % pf)
+    check_permissions(proj, ok, warn)
     return 1 if bad else 0
+
+
+def bash_rule_matches(rule, cmd):
+    """Claude Code permission rule ("Bash", "Bash(git commit *)", legacy "Bash(npm test:*)") against a command."""
+    m = re.fullmatch(r"\s*Bash(?:\((.*)\))?\s*", rule, re.S)
+    if not m:
+        return False
+    pat = (m.group(1) or "*").strip()
+    if pat.endswith(":*"):
+        pat = pat[:-2] + " *"
+    if pat.endswith(" *") and cmd == pat[:-2]:
+        return True
+    return re.fullmatch(".*".join(re.escape(p) for p in pat.split("*")), cmd, re.S) is not None
+
+
+def check_permissions(proj, ok, warn):
+    """Agents run unattended: every gate, test or commit command that needs approval stalls an agent until the
+    user answers. In the dms-hub run that was most of the slow wall time. Warn about each one, with the rules to add."""
+    rules = {"allow": [], "ask": [], "deny": []}
+    modes = []
+    for f in (os.path.expanduser("~/.claude/settings.json"), os.path.join(proj.main, ".claude", "settings.json"),
+              os.path.join(proj.main, ".claude", "settings.local.json")):
+        try:
+            with open(f) as fh:
+                perms = json.load(fh).get("permissions") or {}
+        except (OSError, ValueError):
+            continue
+        for k in rules:
+            rules[k] += [r for r in perms.get(k) or [] if isinstance(r, str)]
+        if perms.get("defaultMode"):
+            modes.append(perms["defaultMode"])
+    if "bypassPermissions" in modes:
+        ok("permissions: bypass mode, agents never wait for approval")
+        return
+    ctx = proj.ctx("T0")
+    need = [(proj.script + " check T0", "Bash(%s *)" % proj.script.split(" ")[0]),
+            ("git add -A", "Bash(git add *)"), ("git commit -m x", "Bash(git commit *)")]
+    for name in proj.repos or [proj.primary]:
+        g = proj.rcfg(name, "gate")
+        cmds = list(g.get("tests") or []) + [c for cond in g.get("conditional") or [] for c in cond.get("run") or []]
+        for c in cmds:
+            c = proj.fmt(c, ctx).strip()
+            if c and (c, "Bash(%s)" % c) not in need:
+                need.append((c, "Bash(%s)" % c))
+    blocked = []
+    for cmd, suggest in need:
+        if any(bash_rule_matches(r, cmd) for r in rules["deny"]):
+            blocked.append((cmd, None, "denied"))
+        elif any(bash_rule_matches(r, cmd) for r in rules["ask"]):
+            blocked.append((cmd, None, "matches an ask rule"))
+        elif not any(bash_rule_matches(r, cmd) for r in rules["allow"]):
+            blocked.append((cmd, suggest, "not allowed"))
+    if not blocked:
+        ok("permissions: the gate, test and commit commands run without prompts")
+        return
+    warn("permissions: %d command(s) agents run will stop and wait for your approval (fine only in auto mode):"
+         % len(blocked))
+    for cmd, _, why in blocked:
+        warn("  %s  (%s)" % (cmd, why))
+    add = [s for _, s, _ in blocked if s]
+    if add:
+        warn("  add to %s permissions.allow (pipes such as `| tail` need their own rule):"
+             % os.path.join(proj.main, ".claude", "settings.local.json"))
+        warn("  " + json.dumps(add))
 
 
 def cmd_ready(proj, args):

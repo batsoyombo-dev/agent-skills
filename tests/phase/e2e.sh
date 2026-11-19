@@ -104,6 +104,15 @@ git add -A && git commit -qm init && git push -q origin staging
 # ---------------------------------------------------------------- plan
 echo "plan"
 out=$(P doctor); has "doctor clean" "$out" "check bash works"; hasnt "doctor has no FAIL" "$out" "^FAIL"
+mkdir -p "$T/home"
+out=$(HOME="$T/home" P doctor)
+has "doctor warns: gate commands would prompt" "$out" "^warn  permissions: [0-9]+ command\(s\) agents run will stop"
+has "doctor suggests the allow rules" "$out" 'Bash\(git commit \*\)'
+echo '{"permissions":{"allow":["Bash"],"ask":["Bash(git commit *)"]}}' > .claude/settings.local.json
+out=$(HOME="$T/home" P doctor); has "doctor: ask rule still prompts" "$out" "git commit -m x  \(matches an ask rule\)"
+echo '{"permissions":{"allow":["Bash(git add *)","Bash(git commit:*)","Bash(*/phase.py *)","Bash(bash *)","Bash(sh *)","Bash(true)","Bash(test *)"]}}' > .claude/settings.local.json
+out=$(HOME="$T/home" P doctor); hasnt "doctor: no permission warning once allowed" "$out" "will stop and wait"
+rm -f .claude/settings.local.json
 out=$(P ready)
 has "A1 ready" "$out" "A1 +A +core +ready"
 has "A3 blocked on A1,A2" "$out" "A3 .*blocked +waits on A1,A2"

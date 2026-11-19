@@ -78,7 +78,7 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `brief.extra` | extra brief lines, e.g. "Migrations: name new files {migration_prefix}01_<name>" |
 | `review.checklist` | project invariants the reviewer checks one by one |
 | `doctor.require` | tools that must exist (placeholders allowed) |
-| `doctor.checks` | `[{name, run}]` commands that must exit 0 (database reachable, infra up) |
+| `doctor.checks` | `[{name, run}]` commands that must exit 0 (database reachable, infra up). `doctor` also warns when a gate, test or commit command agents run would prompt for approval (it reads the user and project `.claude/settings*.json` allow, ask and deny rules) and prints the rules to add |
 
 ## Scope plans (task blocks)
 
