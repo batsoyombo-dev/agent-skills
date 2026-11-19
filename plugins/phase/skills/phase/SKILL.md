@@ -46,9 +46,9 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
   - `partial`: has status text but isn't done. Read the text; the rest is usually a deploy or user step.
   - `manual` with "blocked by open A3, CQ2" (scope plans): the task waits on a client or team answer. Name the question for the user; once it is answered or the assumption confirmed in the plan, the task becomes ready.
 
-  - flags: `serial` (the plan says it can't run in parallel) and phase caps
+  - flags: `serial` (the plan says it can't run in parallel), phase caps, and `unblocks N` (how many unfinished tasks wait on it, directly or through others)
 - Scope: phase ids, task ids or `all`. With no argument, take the first phase with a ready task.
-- Read the project rules (`brief.read` in phase.json) and each candidate's spec before starting it.
+- Read the project rules (`brief.read` in phase.json), and skim each candidate's spec only as far as you need to spot overlapping work. The brief carries the full spec to the implementer (`brief.inline`), so don't load it into your own context.
 - **Never delegate:**
   - `manual` rows
   - anything that touches production (merging to the production branch, production servers or data)
@@ -57,6 +57,7 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
   Tell the user what is needed, with exact commands, and continue with the rest. Every production step needs the user's explicit go, given for that step, after the staging evidence.
 - **Concurrency:**
   - At most `agents.max` implementers at once. Respect a repo's `max_agents` and the phase caps.
+  - With fewer slots than ready tasks, start the highest `unblocks` first: they hold up the most later work.
   - A `serial` task runs with no other task active in the same repo.
   - `$P add` enforces these and refuses with the reason. Pass `--force` only when the user agreed.
   - Don't run two tasks together whose specs rework the same feature (same module, service or table); start the second after the first lands. Shared wiring files (route lists, registries, indexes) are fine: they merge, and the checks catch the rest.
@@ -79,15 +80,19 @@ The agents run in the background and you are notified as each finishes. Don't po
 
 ## 3. Each finished task: gate, then review
 
-1. `$P note <ID> status=review`, then **run the gate yourself**: `$P check <ID>`. Don't trust the report.
+1. `$P note <ID> status=review`, then `$P check <ID> --quick`. It takes seconds: every static check, plus whether review is required.
    - FAIL: send the lines back to the same agent (SendMessage), or fix small things in the worktree yourself, commit, and check again.
-2. Read the diff against the spec and the report (the diff command is in `$P review-brief <ID>`), and check each done-when point.
-3. If the gate printed `review required (...)`, start a `phase-reviewer` agent in the background with `$P review-brief <ID>` as its prompt. Don't add your own conclusions.
+2. If it printed `review required (...)`, start a `phase-reviewer` agent in the background now, with `$P review-brief <ID>` as its prompt. Don't add your own conclusions.
+3. While it reviews, **run the full gate yourself**: `$P check <ID>`. Don't trust the report. Test commands that already passed on this exact commit are not re-run (the record is phase.py's own, and merge runs the full suite again); everything else is checked again. A fix commit needs the gate again, and a new approval.
+4. Read the work:
+   - With a reviewer: read the report and the verdict, not the whole diff. The reviewer reads it line by line in its own context; reading it twice only fills yours.
+   - Without one: read the diff against the spec and the report (the diff command is in `$P review-brief <ID>`), and check each done-when point.
+5. Reviewer verdicts:
    - On `VERDICT: CHANGES`: blockers and majors go back to the implementer, or you fix them; then gate again. Send a blocker fix to the reviewer again.
    - Minors you may record and skip.
    - Then record it: `$P approve <ID> --note "<reviewer APPROVE, or which findings you verified fixed>"`. Merge refuses a required review without an approval for the current tip, so a new commit needs a new approval.
 
-4. No browser, device or visual checks during the run, by you or by any agent: they stall the queue. Collect the screens each task changed (from the reports' "Needs the user") into the final summary, for the user to look at.
+6. No browser, device or visual checks during the run, by you or by any agent: they stall the queue. Collect the screens each task changed (from the reports' "Needs the user") into the final summary, for the user to look at.
 
 ## 4. Merge queue (one task at a time, in finishing order)
 
@@ -120,12 +125,14 @@ Co-Authored-By: <the attribution trailer from the system prompt>"
 - `$P remove <ID>`: teardown hooks, worktree, branch. The report is kept in `.phase/`.
 - `$P overlap`: for every running task that shares files with what just landed, SendMessage its agent: "the base moved (<task> landed, touching <files>); at your next commit run the sync command and check again."
 - **Rolling start:** run `$P ready <scope>` again and start any task in scope that became ready (section 2). Stop when nothing in scope is running, ready or queued.
+- **Wave boundary:** when nothing is running, in review or queued but later tasks remain, and this conversation has grown long, tell the user to `/clear` and run `/phase <scope>` again. The next wave starts with a fresh context, and nothing is lost because state lives in `.phase/`.
 
 ## 5. Report
 
 Finish with a short summary:
 
 - tasks landed (commit shas)
+- where the time went: the slowest step per task from `$P stats`, when one stands out
 - deploy and smoke results
 - decisions made
 - screens the tasks changed, for the user to look at (nothing was checked in a browser)

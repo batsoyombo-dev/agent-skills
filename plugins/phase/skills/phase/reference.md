@@ -76,6 +76,8 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `brief.read` | documents every implementer and reviewer reads first |
 | `brief.rules` | project rules added to every implementer and reviewer prompt |
 | `brief.extra` | extra brief lines, e.g. "Migrations: name new files {migration_prefix}01_<name>" |
+| `brief.inline` | spec sections copied into the brief, so the implementer doesn't spend turns finding and reading them: `[{file, heading, names_from?}]`. `file` may use placeholders and globs (`{spec}`, `docs/plan/*.md`); `heading` is the start of the heading line (`## {ID}` matches `## T0.2 Add tenants`, not `## T0.20`), and the section runs to the next heading of the same or a higher level. With `names_from` (a regex with one group), the entry repeats for each name it finds in the sections copied so far, with `{name}` in `heading`: e.g. `` {"file": "docs/plan/02-data-model.md", "heading": "#### `{name}`", "names_from": "`([a-z_]+)`"} `` copies the subsection of every table the spec names. Scope plans always get their task block copied |
+| `brief.inline_max` | character budget for `brief.inline` (default 40000); sections past it are listed for the implementer to read |
 | `review.checklist` | project invariants the reviewer checks one by one |
 | `doctor.require` | tools that must exist (placeholders allowed) |
 | `doctor.checks` | `[{name, run}]` commands that must exit 0 (database reachable, infra up). `doctor` also warns when a gate, test or commit command agents run would prompt for approval (it reads the user and project `.claude/settings*.json` allow, ask and deny rules) and prints the rules to add |
@@ -101,3 +103,7 @@ Markdown tables under phase headings, either `**P0: Name**` or `## P0: Name` (te
 - **State lock** (`.phase/state.lock`, flock, waits up to 60 s): every state write, and `add`'s capacity check + slot allocation + claim as one step, so racing adds can't exceed the limits or share a slot.
 - **Queue lock** (`.phase/queue.lock`, flock, no wait): held for all of `merge`, `land`, `mark` and `abort`, which share the integration worktree. Busy = exit 3.
 - flock locks are dropped by the kernel when a process exits, crash included, and are not inherited by hooks or test commands. They need a local filesystem: don't put `worktree.dir` on NFS.
+
+## Timing
+
+`add`, `check`, `note status=...`, `approve`, `merge` and `land` append timed events to the task's state. `phase.py stats [ID ...]` turns them into per-task durations: build (add to `status=review`), gate runs (and how many reused a test pass on the same commit), review wait (`status=review` to the last approval), merge attempts, land and total. Use it to see where a slow run's time went.

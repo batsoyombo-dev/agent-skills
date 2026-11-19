@@ -100,7 +100,8 @@ DEFAULTS = {
     },
     "deploy": None,
     "smoke": None,
-    "brief": {"spec": "{spec}", "done_when": "{done_when}", "read": [], "rules": [], "extra": []},
+    "brief": {"spec": "{spec}", "done_when": "{done_when}", "read": [], "rules": [], "extra": [],
+              "inline": [], "inline_max": 40000},
     "review": {"checklist": []},
     "doctor": {"require": [], "checks": []},
     "repos": {},
@@ -288,6 +289,16 @@ class Project:
                 json.dump(st, f, indent=1, sort_keys=True)
             os.replace(tmp, self.sfile(_task))
             return st
+
+    def event(self, _task, name, **data):
+        """Append a timed event to a known task's state; `phase.py stats` turns them into durations."""
+        with self.lock():
+            st = self.state(_task)
+            if not st:
+                return None
+            ev = (st.get("events") or [])[-199:]
+            ev.append(dict(data, e=name, t=int(time.time())))
+            return self.save(_task, events=ev)
 
     # -- locks (see FileLock and the lease functions below)
     def lock(self):
@@ -1087,6 +1098,7 @@ def cmd_ready(proj, args):
     tasks, by_id = load_plan(proj)
     scope = args.scope
     rows = []
+    unblocks = unblock_counts(tasks, proj.cfg["plan"])
     for t in tasks:
         if scope and "all" not in scope and t["id"] not in scope and t["phase"]["id"] not in scope:
             continue
@@ -1100,9 +1112,33 @@ def cmd_ready(proj, args):
             flags.append("phase cap %d" % t["phase"]["cap"])
         if state == "ready" and t.get("blocked_by"):
             flags.append("assumes open " + ", ".join(t["blocked_by"]))
+        if state == "ready" and unblocks.get(t["id"]):
+            flags.append("unblocks %d" % unblocks[t["id"]])
         title = re.sub(r"\s+", " ", t["task"])
         rows.append([t["id"], t["phase"]["id"], t["repo"], state, "; ".join([detail] + flags), title[:70]])
     print_table(["TASK", "PHASE", "REPO", "STATE", "DETAIL", "TITLE"], rows)
+
+
+def unblock_counts(tasks, pcfg):
+    """For each unfinished task, how many unfinished tasks wait on it, directly or through others. Starting the
+    ready task with the highest count first keeps the most agents busy later (critical path)."""
+    done = re.compile(pcfg["done"], re.I)
+    open_ids = {t["id"] for t in tasks if not done.search(t["status"])}
+    waiters = {}
+    for t in tasks:
+        if t["id"] in open_ids:
+            for d in expand_deps(t["deps"])[0]:
+                waiters.setdefault(d, set()).add(t["id"])
+    out = {}
+    for tid in open_ids:
+        seen, todo = set(), list(waiters.get(tid, ()))
+        while todo:
+            x = todo.pop()
+            if x not in seen:
+                seen.add(x)
+                todo += list(waiters.get(x, ()))
+        out[tid] = len(seen)
+    return out
 
 
 def print_table(head, rows):
@@ -1170,6 +1206,7 @@ def cmd_add(proj, args):
             slot = alloc_slot(proj)
             proj.save(task, task=task, status="running", started=now(), repo=repo, slot=slot, serial=serial,
                       phase=row["phase"]["id"] if row else "", port=proj.cfg["slots"]["port_base"] + int(slot))
+            proj.event(task, "added")
     try:
         add_worktree(proj, args, task, repo, row, serial)
     except Fail:
@@ -1203,6 +1240,59 @@ def add_worktree(proj, args, task, repo, row, serial):
     prepare_wt(proj, repo, wt, c, "add")
     print("worktree: %s (branch %s from %s @ %s)" % (wt, branch, proj.base_ref(), proj.state(task)["base"][:7]))
     print("brief:    %s brief %s" % (proj.script, task))
+
+
+def md_section(text, heading):
+    """The markdown section whose heading line starts with `heading` (up to a word boundary, so `## T0.2` is not
+    `## T0.20`), through the line before the next heading of the same or a higher level. None when absent."""
+    lines = text.splitlines()
+    fence, start, level = False, None, 0
+    for i, line in enumerate(lines):
+        s = line.rstrip()
+        if s.lstrip().startswith("```"):
+            fence = not fence
+            continue
+        m = None if fence else re.match(r"^(#{1,6})\s", s)
+        if start is None:
+            if m and s.startswith(heading) and not re.match(r"[\w.]", s[len(heading):len(heading) + 1]):
+                start, level = i, len(m.group(1))
+        elif m and len(m.group(1)) <= level:
+            return "\n".join(lines[start:i]).rstrip()
+    return "\n".join(lines[start:]).rstrip() if start is not None else None
+
+
+def inline_sections(proj, c, row):
+    """Spec sections to paste into the brief, so the implementer starts coding instead of spending turns finding
+    and reading them: the task block of a scope plan, then each `brief.inline` entry. Returns ([(label, text)], skipped)."""
+    b = proj.rcfg(c["repo"], "brief")
+    found = []
+    if "criteria" in row:  # scope plan: the task's own block
+        sec = md_section(proj.plan_text(), "#### " + row["id"])
+        if sec:
+            found.append(("%s, task block %s" % (proj.cfg["plan"]["file"], row["id"]), sec))
+    for ent in b.get("inline") or []:
+        m = re.search(r"[\w./*-]+\.\w+", proj.fmt(ent.get("file", ""), c).replace("`", ""))
+        if not m or not ent.get("heading"):
+            continue
+        files = sorted(glob.glob(os.path.join(c["wt"], m.group(0))))
+        names = [""]
+        if ent.get("names_from"):
+            names = list(dict.fromkeys(re.findall(ent["names_from"], "\n".join(t for _, t in found))))
+        for name in names:
+            heading = proj.fmt(ent["heading"], dict(c, name=name))
+            for f in files:
+                sec = md_section(open(f, encoding="utf-8").read(), heading)
+                if sec and all(sec != t for _, t in found):
+                    found.append(("%s, section %s" % (os.path.relpath(f, c["wt"]), heading.lstrip("# ")), sec))
+                    break
+    budget, out, skipped = int(b.get("inline_max") or 40000), [], []
+    for label, text in found:
+        if len(text) <= budget:
+            out.append((label, text))
+            budget -= len(text)
+        else:
+            skipped.append(label)
+    return out, skipped
 
 
 def cmd_brief(proj, args):
@@ -1244,6 +1334,14 @@ def cmd_brief(proj, args):
         "Report: %s/%s" % (c["wt"], REPORT),
         "Context from other tasks: none",
     ]
+    sections, skipped = inline_sections(proj, c, row)
+    if sections:
+        lines += ["", "Spec text, copied from the worktree at the cut point. It is complete: don't search for or "
+                  "re-read these sections; read only the other documents listed above."]
+        for label, text in sections:
+            lines += ["", "===== %s =====" % label, text]
+    if skipped:
+        lines += ["", "Not copied (over brief.inline_max), read them yourself: " + "; ".join(skipped)]
     print("\n".join(lines))
     if args.inline_rules:
         candidates = [os.path.join(SKILL_DIR, "agents", "phase-implementer.md"),
@@ -1290,6 +1388,8 @@ def cmd_note(proj, args):
     if not proj.state(args.task):
         die("unknown task %s (add it first)" % args.task)
     proj.save(args.task, **kv)
+    if "status" in kv:
+        proj.event(args.task, "status", to=kv["status"])
 
 
 def cmd_status(proj, args):
@@ -1336,6 +1436,55 @@ def cmd_status(proj, args):
         iw = proj.int_wt(repo)
         if os.path.isdir(iw) and git(iw, "status", "--porcelain"):
             print("integration (%s): merge in progress at %s" % (repo, iw))
+
+
+def dur(secs):
+    if secs is None:
+        return "-"
+    secs = int(secs)
+    if secs < 60:
+        return "%ds" % secs
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    return "%dh%02dm" % (secs // 3600, secs % 3600 // 60)
+
+
+def cmd_stats(proj, args):
+    """Where each task's time went, from the events phase.py records (add, check, note status, approve, merge, land)."""
+    rows, sums = [], {"build": 0, "gate": 0, "review": 0, "merge": 0, "land": 0}
+    for st in proj.states():
+        ev = st.get("events") or []
+        if not ev or (args.task and norm_id(st.get("task", "")) not in [norm_id(t) for t in args.task]):
+            continue
+        first = lambda name, **kw: next((e for e in ev if e["e"] == name and all(e.get(k) == v for k, v in kw.items())), None)  # noqa: E731
+        added, review_at = first("added"), first("status", to="review")
+        landed = first("landed")
+        approvals = [e for e in ev if e["e"] == "approved"]
+        checks = [e for e in ev if e["e"] == "check" and not e.get("quick")]
+        merges = [e for e in ev if e["e"] == "merge"]
+        build = review_at["t"] - added["t"] if added and review_at else None
+        gate = sum(e.get("secs", 0) for e in checks)
+        review = approvals[-1]["t"] - review_at["t"] if review_at and approvals else None
+        merge = sum(e.get("secs", 0) for e in merges)
+        land = landed.get("secs") if landed else None
+        end = landed["t"] if landed else int(time.time())
+        total = end - added["t"] if added else None
+        for k, v in (("build", build), ("gate", gate), ("review", review), ("merge", merge), ("land", land)):
+            sums[k] += v or 0
+        rows.append([st.get("task", "?"), st.get("status", "-"), dur(build),
+                     "%d× %s%s" % (len(checks), dur(gate), (" (%d reused)" % sum(1 for e in checks if e.get("reused")))
+                                    if any(e.get("reused") for e in checks) else ""),
+                     dur(review), "%d× %s" % (len(merges), dur(merge)) if merges else "-", dur(land),
+                     dur(total) + ("" if landed else " (open)")])
+    if not rows:
+        print("no timing events yet (they are recorded from phase 1.4 on)")
+        return 0
+    print_table(["TASK", "STATUS", "BUILD", "GATE", "REVIEW", "MERGE", "LAND", "TOTAL"], rows)
+    print("\nsum: build %s, gate %s, review %s, merge %s, land %s" % tuple(dur(sums[k]) for k in
+                                                                         ("build", "gate", "review", "merge", "land")))
+    print("build = add to status=review (the implementer); gate = full checks the orchestrator and implementer ran;"
+          " review = status=review to the last approval")
+    return 0
 
 
 def cmd_overlap(proj, args):
@@ -1419,7 +1568,9 @@ def cmd_check(proj, args):
             print("        " + l)
         warns[0] += 1
 
+    t0 = time.time()
     proj.fetch(proj.repo_root(repo))
+    head = git(wt, "rev-parse", "HEAD")
     base = git(wt, "merge-base", proj.base_ref(), "HEAD")
     ahead = int(git(wt, "rev-list", "--count", "%s..HEAD" % proj.base_ref()))
     behind = int(git(wt, "rev-list", "--count", "HEAD..%s" % proj.base_ref()))
@@ -1499,11 +1650,22 @@ def cmd_check(proj, args):
     need = ("required (%s)" % " ".join(sorted(review))) if review else "optional"
     P("diff: %d files, %d lines changed; review %s" % (len(files), churn, need))
 
+    tests_secs, reused = 0, False
     if not args.quick:
         cmds = test_commands(proj, repo, paths)
-        if cmds:
+        prev = st.get("tests_pass") or {}
+        if cmds and not args.full and not dirty and prev.get("sha") == head:
+            # The same gate passed the tests on this exact commit (recorded by phase.py, not claimed by an agent).
+            # merge runs the full checks again on the squash, so re-running them here only costs time.
+            reused = True
+            P("tests passed on this commit at %s; not re-run (--full re-runs them)" % prev.get("at", "?"))
+        elif cmds:
+            t1 = time.time()
             okk, summary = run_tests(proj, repo, wt, c, cmds, os.path.join(proj.state_dir, norm_id(task) + ".check.log"))
+            tests_secs = int(time.time() - t1)
             P(summary) if okk else F(summary)
+            if okk and not dirty:
+                proj.save(task, tests_pass={"sha": head, "at": now()})
         else:
             W("no gate.tests configured")
         report = os.path.join(wt, REPORT)
@@ -1512,12 +1674,15 @@ def cmd_check(proj, args):
         else:
             W("no %s yet" % report)
 
+    timing = dict(quick=bool(args.quick), secs=int(time.time() - t0), tests_secs=tests_secs, reused=reused)
     if fails[0] == 0:
-        if not args.quick:
-            proj.save(task, check="pass:" + git(wt, "rev-parse", "HEAD"), review=need)
+        # --quick also records whether review is required, so the reviewer can start before the full gate runs.
+        proj.save(task, review=need, **({} if args.quick else {"check": "pass:" + head}))
+        proj.event(task, "check", ok=True, **timing)
         print("RESULT: PASS (%d warning(s)); review %s" % (warns[0], need))
         return 0
     proj.save(task, check="fail")
+    proj.event(task, "check", ok=False, **timing)
     print("RESULT: FAIL (%d failure(s), %d warning(s))" % (fails[0], warns[0]))
     return 1
 
@@ -1542,10 +1707,12 @@ def cmd_merge(proj, args):
     if (st.get("review") or "").startswith("required") and st.get("approved") != tip:
         die("review %s and no approval recorded for the tip %s. After the reviewer's APPROVE (or after you verified its "
             "findings are fixed): %s approve %s --note \"<who/what>\"" % (st["review"], tip[:7], proj.script, task))
+    t0 = time.time()
     iw = ensure_int(proj, repo)
     if repo != proj.primary:
         ensure_int(proj, proj.primary)
     if not git_ok(iw, "merge", "--squash", br):
+        proj.event(task, "merge", result="conflict", secs=int(time.time() - t0))
         print("CONFLICT squashing %s onto %s:" % (br, proj.base_ref()))
         for f in git(iw, "diff", "--name-only", "--diff-filter=U").splitlines():
             print("  " + f)
@@ -1561,10 +1728,12 @@ def cmd_merge(proj, args):
                              os.path.join(proj.state_dir, norm_id(task) + ".merge.log"))
     if not okk:
         git(iw, "reset", "-q", "--hard", proj.base_ref())
+        proj.event(task, "merge", result="red", secs=int(time.time() - t0))
         print("FAIL  full checks after the squash onto the current %s: %s" % (proj.base_ref(), summary))
         print("The task was green alone, so it collides with something landed since it was cut: sync, fix, check, merge")
         return 1
     proj.save(task, status="merging", merge_onto=git(iw, "rev-parse", "HEAD"))
+    proj.event(task, "merge", result="ok", secs=int(time.time() - t0))
     pf = proj.cfg["land"]["progress_file"]
     piw = proj.int_wt(proj.primary)
     print("ok    squash of %s staged on %s @ %s; %s" % (br, proj.base_ref(), git(iw, "rev-parse", "--short", "HEAD"), summary))
@@ -1640,6 +1809,7 @@ def cmd_land(proj, args):
     task, repo = st["task"], st.get("repo", proj.primary)
     if st.get("status") not in ("merging", "landing"):
         die("%s has no staged merge; run: %s merge %s" % (task, proj.script, task))
+    t0 = time.time()
     step = st.get("land_step", "") if st.get("status") == "landing" else ""
     if step:
         info("resuming land of %s after step '%s'" % (task, step))
@@ -1693,6 +1863,7 @@ def cmd_land(proj, args):
     if wt and os.path.exists(os.path.join(wt, REPORT)):
         shutil.copy2(os.path.join(wt, REPORT), os.path.join(proj.state_dir, norm_id(task) + ".report.md"))
     proj.save(task, status="merged", commit=sha, other_commit=other or "", merged_at=now())
+    proj.event(task, "landed", secs=int(time.time() - t0))
     print("landed %s: %s %s%s on %s" % (task, proj.primary, sha[:7], (", %s %s" % (repo, other[:7])) if other else "", proj.base))
     nxt = []
     if proj.rcfg(proj.primary, "deploy"):
@@ -1791,6 +1962,7 @@ def cmd_approve(proj, args):
     task, repo = st["task"], st.get("repo", proj.primary)
     tip = git(proj.repo_root(repo), "rev-parse", "phase/" + norm_id(task))
     proj.save(task, approved=tip, approved_note=args.note or "")
+    proj.event(task, "approved")
     print("review approval recorded for %s @ %s%s" % (task, tip[:7], (": " + args.note) if args.note else ""))
 
 
@@ -1954,9 +2126,12 @@ Work
   note <ID> key=value ...     record agent=<agent id>, status=review, ...
   status [--all]              every task: status, agent, ahead/behind, tree, gate, review need, last commit
   overlap                     files touched by more than one active task, or by the base since a task was cut
+  stats [ID ...]              where the time went per task: build, gate runs, review wait, merge, land
   sync <ID> [--keep]          rebase the task onto the base (aborts on conflict unless --keep), refresh hooks
-  check <ID> [--quick]        the gate: forbidden/owned/immutable files, rules, secrets, tests changed, skip
-                              markers, per-file checks, test commands
+  check <ID> [--quick|--full] the gate: forbidden/owned/immutable files, rules, secrets, tests changed, skip
+                              markers, per-file checks, test commands. Test commands that already passed on
+                              this exact commit are not re-run unless --full; --quick skips them (and records
+                              whether review is required, so the reviewer can start early)
   approve <ID> [--note TEXT]  record that a required review approved the current tip (merge needs it)
   mark <ID> [STATUS]          after merge: set the task's status in the plan (block Status line, ticks its
                               criteria; or the table's status cell). Default "done" / "done <date>"
@@ -2010,10 +2185,13 @@ def main(argv):
         sub.add_argument("pairs", nargs="+")
     if cmd == "status":
         sub.add_argument("--all", action="store_true")
+    if cmd == "stats":
+        sub.add_argument("task", nargs="*")
     if cmd == "sync":
         sub.add_argument("--keep", action="store_true")
     if cmd == "check":
         sub.add_argument("--quick", action="store_true")
+        sub.add_argument("--full", action="store_true")
     if cmd == "land":
         sub.add_argument("message")
     if cmd == "deploy-wait":
@@ -2031,7 +2209,7 @@ def main(argv):
         "doctor": cmd_doctor, "ready": cmd_ready, "brief": cmd_brief, "review-brief": cmd_review_brief,
         "add": cmd_add, "note": cmd_note, "status": cmd_status, "overlap": cmd_overlap, "sync": cmd_sync,
         "check": cmd_check, "merge": cmd_merge, "land": cmd_land, "abort": cmd_abort, "approve": cmd_approve,
-        "mark": cmd_mark, "lease": cmd_lease,
+        "mark": cmd_mark, "lease": cmd_lease, "stats": cmd_stats,
 
         "deploy-wait": cmd_deploy_wait, "smoke": cmd_smoke, "remove": cmd_remove,
     }

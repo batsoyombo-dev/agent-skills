@@ -40,6 +40,9 @@ P add T0.1 >/dev/null
 out=$(P brief T0.1)
 has "brief points at the task block" "$out" "Spec: the \`#### T0.1\` task block in docs/plans/fix.md"
 has "brief has the acceptance criteria" "$out" "Done when: The test fails on current"
+has "brief copies the task block" "$out" "^===== docs/plans/fix.md, task block T0.1 ====="
+has "copied block is T0.1's" "$out" "^#### T0.1 "
+hasnt "copied block stops before the next task" "$out" "^#### T1.1 "
 has "brief has the plan's verify commands" "$out" "Verify \\(from the plan; run these too\\): bun test apps/api/src/reports/export.test.ts"
 
 ( cd .worktrees/t0_1 && mkdir -p apps && echo t > apps/export.test.ts && git add -A && git commit -qm "T0.1: test" )

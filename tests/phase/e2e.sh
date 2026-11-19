@@ -51,6 +51,8 @@ cat > docs/plan/progress.md <<'EOF'
 | B1 | App screen | A1 | agent | |
 EOF
 printf 'greet() { echo hi; }\n' > src/lib.sh
+printf '# Spec\n## A1 Add greeting\nUse the `greetings` table.\n### Notes\ninner note A1\n## A10 Not this one\nA10 body\n' > docs/plan/spec.md
+printf '# Data\n#### `greetings`\ngreetings columns\n#### `farewells`\nfarewells columns\n' > docs/plan/data.md
 printf 'one\n' > routes.txt
 printf 'create table t (id int);\n' > migrations/2026_01_01_100000_init.sql
 cat > test.sh <<'EOF'
@@ -94,7 +96,9 @@ cat > .claude/phase.json <<EOF
   "land": { "progress_file": "docs/plan/progress.md" },
   "smoke": { "base_url": "http://127.0.0.1:$PORT" },
   "brief": { "spec": "the {ID} row in docs/plan/progress.md", "read": ["README.md"],
-             "rules": ["Shell only."], "extra": ["Migrations: name new files {migration_prefix}01_<name>.sql"] },
+             "rules": ["Shell only."], "extra": ["Migrations: name new files {migration_prefix}01_<name>.sql"],
+             "inline": [{ "file": "docs/plan/spec.md", "heading": "## {ID}" },
+                        { "file": "docs/plan/data.md", "heading": "#### \`{name}\`", "names_from": "\`([a-z_]+)\`" }] },
   "doctor": { "require": ["git", "bash"], "checks": [{ "name": "bash works", "run": "true" }] }
 }
 EOF
@@ -117,6 +121,7 @@ out=$(P ready)
 has "A1 ready" "$out" "A1 +A +core +ready"
 has "A3 blocked on A1,A2" "$out" "A3 .*blocked +waits on A1,A2"
 has "A4 manual (owner you)" "$out" "A4 .*manual +owner you"
+has "ready shows what a task unblocks" "$out" "A1 .*unblocks 2"
 has "B1 routed to the app repo" "$out" "B1 +B +app +blocked"
 
 # ---------------------------------------------------------------- add, isolation, brief
@@ -134,6 +139,10 @@ has "brief has the gate command" "$out" "check A1"
 has "brief has project rules" "$out" "Shell only"
 has "brief renders slot vars" "$out" "Migrations: name new files [0-9_]+00"
 has "brief fills done-when" "$out" "Done when: every acceptance point"
+has "brief inlines the task's spec section" "$out" "inner note A1"
+hasnt "inlined section stops at the next heading" "$out" "A10 body"
+has "brief inlines sections named in the spec" "$out" "greetings columns"
+hasnt "brief skips sections the spec doesn't name" "$out" "farewells columns"
 
 # ---------------------------------------------------------------- gate catches violations
 echo "gate"
@@ -168,7 +177,11 @@ has "gate fails" "$out" "RESULT: FAIL"
   echo a2 >> routes.txt; printf 'bye() { echo bye; }\n' > src/bye.sh
   printf 'alter table t add c int;\n' > migrations/2026_11_17_110001_add_c.sql
   git add -A && git commit -qm "A2: farewell" )
+has "quick gate says review is required" "$(P check A2 --quick)" "review required \\(schema\\)"
+has "review-brief works after a quick gate" "$(P review-brief A2)" "Why review is required: required \\(schema\\)"
 has "gate passes after fixes" "$(P check A1)" "RESULT: PASS"
+out=$(P check A1); has "gate reuses tests passed on the same commit" "$out" "not re-run"; has "reused gate passes" "$out" "RESULT: PASS"
+hasnt "check --full re-runs the tests" "$(P check A1 --full)" "not re-run"
 has "overlap sees the shared file" "$(P overlap)" "core:routes.txt +A1, A2"
 P note A1 agent=agent-a1 >/dev/null
 has "status shows agent and gate" "$(P status)" "A1 +core +running +agent-a1 .* pass"
@@ -205,6 +218,7 @@ has "merge queue is serial" "$(P merge A3)" "merge queue is busy with A2"
 P remove A3 --force >/dev/null
 edit 's/^\| A2 \| Add farewell \| — \| agent \| \|$/| A2 | Add farewell | — | agent | done 2026-11-17 |/' .worktrees/_integration/docs/plan/progress.md
 has "land A2" "$(P land A2 'A2: farewell')" "landed A2"
+out=$(P stats); has "stats lists a landed task" "$out" "A2 +merged"; has "stats counts merge attempts" "$out" "A2 .* [0-9]+× "
 
 # ---------------------------------------------------------------- secondary repo
 echo "secondary repo"
