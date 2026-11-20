@@ -8,11 +8,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the version check diffs against the commit before the push
       - name: Python syntax
-        run: python3 -m py_compile plugins/*/skills/*/*.py
+        run: python3 -m py_compile $(git ls-files "*.py")
       - name: Shell syntax
-        run: for f in install.sh tests/run.sh tests/*/*.sh; do bash -n "$f"; done
+        run: for f in install.sh .github/*.sh tests/run.sh tests/*/*.sh; do bash -n "$f"; done
       - name: Plugin manifests are valid JSON
         run: for f in .claude-plugin/marketplace.json plugins/*/.claude-plugin/plugin.json; do python3 -m json.tool "$f" >/dev/null; done
+      - name: Changed plugins bump their version
+        run: bash .github/check-versions.sh "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}"
       - name: Tests
         run: bash tests/run.sh

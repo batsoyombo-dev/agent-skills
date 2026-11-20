@@ -34,7 +34,7 @@ Other commands:
 ```bash
 ~/.agent-skills/install.sh --update      # pull, relink, drop links to removed skills
 ~/.agent-skills/install.sh --list        # what is available and installed
-~/.agent-skills/install.sh ship          # only some plugins
+~/.agent-skills/install.sh ship          # only the named plugins (today there is one: ship)
 ~/.agent-skills/install.sh --uninstall   # remove only the links that point into the checkout
 ```
 
@@ -51,6 +51,8 @@ The repo is also a plugin marketplace:
 
 Plugins are copied into Claude Code's cache, and their names get the plugin's prefix (`/ship:phase`, `/ship:scope`, agent `ship:phase-implementer`). Update with `/plugin marketplace update agent-skills`. Use one install method per machine, not both: the installer warns when it finds both.
 
+Upgrading from the old separate plugins (before 2.0.0): `/plugin uninstall phase@agent-skills`, `/plugin uninstall scope@agent-skills`, then `/plugin install ship@agent-skills`. With `install.sh`, `--update` relinks everything and nothing else changes.
+
 ## Use phase in a repo
 
 ```bash
@@ -58,6 +60,8 @@ Plugins are copied into Claude Code's cache, and their names get the plugin's pr
 ~/.claude/skills/phase/phase.py doctor
 ~/.claude/skills/phase/phase.py ready
 ```
+
+These paths are where `install.sh` puts the engine. With a plugin install, ask Claude to "set up phase for this repo" instead; the skill's Setup section does the same steps.
 
 Then ask Claude to "run phase P0" (or `/ship:phase P0`; `/phase P0` with `install.sh`). Commit `.claude/phase.json` with the repo.
 
@@ -67,7 +71,7 @@ No plan yet? `/ship:scope <brief>` writes one in `docs/plans/`; point `plan.file
 
 - On your own machine, install from your working copy (`./install.sh` in the clone). The links point at it, so edits are live; start a new Claude Code session to reload a skill.
 - Run all tests before pushing: `tests/run.sh`. CI runs them on Linux for every push; the macOS workflow (installer under bash 3.2) runs when `install.sh` changes, or by hand. The phase test builds throwaway repos with local remotes, so nothing reaches GitHub or a server.
-- When a plugin changes behaviour, bump `version` in its `.claude-plugin/plugin.json`, so plugin installs pick up the update.
+- Any change under `plugins/<name>/` needs a new `version` in its `.claude-plugin/plugin.json`, or plugin installs never see it. CI enforces this; check before pushing with `.github/check-versions.sh origin/main`.
 
 ### Add a skill
 

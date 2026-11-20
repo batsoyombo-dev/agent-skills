@@ -2,9 +2,9 @@
 # Install our agent skills into Claude Code by symlinking them from this checkout into ~/.claude.
 #
 #   ./install.sh                 install (or relink) every skill and agent
-#   ./install.sh phase           only the named plugins
+#   ./install.sh ship            only the named plugins (today there is one: ship)
 #   ./install.sh --update        git pull, then relink and drop links to things that were removed
-#   ./install.sh --uninstall     remove every link that points into this checkout (or: --uninstall phase)
+#   ./install.sh --uninstall     remove every link that points into this checkout (or: --uninstall ship)
 #   ./install.sh --list          show what is available and what is installed
 #
 # New device, one command (the repo is private, so it goes through your GitHub login):
@@ -107,6 +107,7 @@ prune() { # drop links into this checkout whose source is gone
 
 uninstall() { # [plugin...]
   local t p keep
+  for p in "$@"; do [ -d "$ROOT/plugins/$p" ] || die "no plugin '$p' (available: $(plugins | tr '\n' ' '))"; done
   for t in "$CLAUDE_DIR"/skills/* "$CLAUDE_DIR"/agents/*; do
     points_into_repo "$t" || continue
     if [ $# -gt 0 ]; then

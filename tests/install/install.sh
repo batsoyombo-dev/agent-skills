@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Test install.sh against a throwaway Claude config dir: link, idempotence, conflicts backed up outside the
-# scanned dirs, stale-link pruning, list, partial and full uninstall. Exit 0 = all passed.
+# scanned dirs, stale-link pruning, list, unknown plugin names, per-plugin and full uninstall. Exit 0 = all passed.
 set -uo pipefail
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 T=$(mktemp -d "${TMPDIR:-/tmp}/install-test.XXXXXX"); trap 'rm -rf "$T"' EXIT
@@ -23,11 +23,13 @@ has "skill resolves to the repo" "$(readlink "$T/skills/phase")" "plugins/ship/s
 has "engine is executable" "$(test -x "$T/skills/phase/phase.py" && echo yes)" "yes"
 has "idempotent" "$(I)" "ok +skills/phase"
 has "list" "$(I --list)" "skill +phase +\\[installed\\]"
-I --uninstall phase >/dev/null
-has "uninstall removes our links" "$(ls "$T/skills" "$T/agents")" "unrelated.md"
-has "uninstall leaves other files" "$(cat "$T/agents/unrelated.md")" "mine"
-has "partial uninstall keeps other plugins" "$(ls "$T/skills")" "^scope$"
 has "links scope too" "$(readlink "$T/skills/scope")" "plugins/ship/skills/scope$"
-I --uninstall >/dev/null
-has "nothing of ours left" "$(find "$T/skills" "$T/agents" -type l | wc -l | tr -d ' ')" "^0$"
+has "unknown plugin is refused" "$(I phase)" "no plugin 'phase' \\(available: ship"
+has "unknown plugin uninstall is refused" "$(I --uninstall phase)" "no plugin 'phase'"
+has "a refused uninstall removes nothing" "$(ls "$T/skills" | tr '\n' ' ')" "phase scope"
+I --uninstall ship >/dev/null
+has "uninstall by plugin removes its links" "$(find "$T/skills" "$T/agents" -type l | wc -l | tr -d ' ')" "^0$"
+has "uninstall leaves other files" "$(cat "$T/agents/unrelated.md")" "mine"
+I >/dev/null; I --uninstall >/dev/null
+has "full uninstall: nothing of ours left" "$(find "$T/skills" "$T/agents" -type l | wc -l | tr -d ' ')" "^0$"
 echo; echo "install test: $pass passed, $fail failed"; [ "$fail" -eq 0 ]
