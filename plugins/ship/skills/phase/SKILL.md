@@ -13,7 +13,7 @@ The engine is `phase.py` in this skill's base directory (the path shown when the
 <base directory>/phase.py --project <repo> help
 ```
 
-The agent types are `phase-implementer` and `phase-reviewer`. When the skill is installed as a plugin they are listed as `phase:phase-implementer` and `phase:phase-reviewer`; use whichever name the agent list shows.
+The agent types are `phase-implementer` and `phase-reviewer`. When the skill is installed as a plugin they are listed as `ship:phase-implementer` and `ship:phase-reviewer`; use whichever name the agent list shows.
 
 ## Setup (once per repo)
 
@@ -74,7 +74,7 @@ $P brief <ID>      # the implementer prompt
 
 Replace the brief's `Context from other tasks: none` with anything decided this session that the spec doesn't say: an interface another task depends on, a user decision, a file another running task is reworking.
 
-Send all Agent calls **in one message**: `subagent_type` the implementer type (`phase-implementer` or `phase:phase-implementer`), the brief as the prompt, description `<ID>: <short task>`. If that agent type isn't listed, use `general-purpose` with `$P brief <ID> --inline-rules`. Then record each agent id: `$P note <ID> agent=<id>`.
+Send all Agent calls **in one message**: `subagent_type` the implementer type (`phase-implementer` or `ship:phase-implementer`), the brief as the prompt, description `<ID>: <short task>`. If that agent type isn't listed, use `general-purpose` with `$P brief <ID> --inline-rules`. Then record each agent id: `$P note <ID> agent=<id>`.
 
 The agents run in the background and you are notified as each finishes. Don't poll. Meanwhile, review and land whatever is done.
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end test of plugins/phase: builds throwaway repos with local bare remotes (nothing leaves the machine)
+# End-to-end test of the phase skill: builds throwaway repos with local bare remotes (nothing leaves the machine)
 # and walks the whole flow: doctor, ready, add, isolation, brief, gate, overlap, merge, land, conflicts,
 # a secondary repo, smoke, remove, resume and local-only mode. Exit 0 = all passed.
 # Needs git, python3, bash. Run: tests/phase/e2e.sh   (KEEP=1 keeps the temp dir for inspection)
 set -uo pipefail
 
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PHASE="$ROOT/plugins/phase/skills/phase/phase.py"
+PHASE="$ROOT/plugins/ship/skills/phase/phase.py"
 T=$(mktemp -d "${TMPDIR:-/tmp}/phase-e2e.XXXXXX")
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_EDITOR=true

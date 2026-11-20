@@ -4,14 +4,9 @@
   "metadata": { "description": "Our Claude Code skills and agents." },
   "plugins": [
     {
-      "name": "phase",
-      "source": "./plugins/phase",
-      "description": "Run a project's plan tasks in parallel: one worktree and agent per task, a deterministic gate, independent review, and a serial merge queue onto the base branch."
-    },
-    {
-      "name": "scope",
-      "source": "./plugins/scope",
-      "description": "Turn any brief into a standardized, validated, phased execution plan for coding agents, plus client questions. /phase runs it."
+      "name": "ship",
+      "source": "./plugins/ship",
+      "description": "Plan and ship code with agents: /ship:scope writes a validated phased plan from any brief, /ship:phase runs its tasks in parallel through worktrees, a gate, independent review and a serial merge queue."
     }
   ]
 }

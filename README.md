@@ -2,10 +2,14 @@
 
 Our Claude Code skills and agents, in one place, installable on any machine with one command.
 
-| Plugin | What it gives you |
+Everything ships as one plugin, `ship`:
+
+| Skill | What it gives you |
 |---|---|
-| [`scope`](plugins/scope/skills/scope/SKILL.md) | `/scope <brief>`: turns a brief, feature idea or bug report into a validated phased plan (`docs/plans/<id>.md`): tasks with IDs, dependencies, acceptance criteria and verify commands, marked assumptions, and client questions ready to forward. `/phase` runs the plan directly. |
-| [`phase`](plugins/phase/skills/phase/SKILL.md) | `/phase`: runs a project's plan tasks in parallel. One git worktree, environment and implementer agent per task; a deterministic gate; an independent reviewer; a serial merge queue onto the base branch (squash, full checks, progress file in the same commit, push, deploy watch, smoke). Project-agnostic: each repo describes itself in `.claude/phase.json` ([reference](plugins/phase/skills/phase/reference.md)). Agents: `phase-implementer`, `phase-reviewer`. |
+| [`scope`](plugins/ship/skills/scope/SKILL.md) | `/ship:scope <brief>`: turns a brief, feature idea or bug report into a validated phased plan (`docs/plans/<id>.md`): tasks with IDs, dependencies, acceptance criteria and verify commands, marked assumptions, and client questions ready to forward. `phase` runs the plan directly. |
+| [`phase`](plugins/ship/skills/phase/SKILL.md) | `/ship:phase`: runs a project's plan tasks in parallel. One git worktree, environment and implementer agent per task; a deterministic gate; an independent reviewer; a serial merge queue onto the base branch (squash, full checks, progress file in the same commit, push, deploy watch, smoke). Project-agnostic: each repo describes itself in `.claude/phase.json` ([reference](plugins/ship/skills/phase/reference.md)). Agents: `ship:phase-implementer`, `ship:phase-reviewer`. |
+
+Installed with `install.sh` instead of as a plugin, the same skills are plain `/scope` and `/phase` (agents `phase-implementer`, `phase-reviewer`). Asking in plain words ("scope this brief", "run phase P0") works either way.
 
 ## Install
 
@@ -30,7 +34,7 @@ Other commands:
 ```bash
 ~/.agent-skills/install.sh --update      # pull, relink, drop links to removed skills
 ~/.agent-skills/install.sh --list        # what is available and installed
-~/.agent-skills/install.sh phase         # only some plugins
+~/.agent-skills/install.sh ship          # only some plugins
 ~/.agent-skills/install.sh --uninstall   # remove only the links that point into the checkout
 ```
 
@@ -42,10 +46,10 @@ The repo is also a plugin marketplace:
 
 ```
 /plugin marketplace add git@github.com:batsoyombo-dev/agent-skills.git
-/plugin install phase@agent-skills
+/plugin install ship@agent-skills
 ```
 
-Plugins are copied into Claude Code's cache, and their names get a prefix (`/phase:phase`, agent `phase:phase-implementer`). Update with `/plugin marketplace update agent-skills`. Use one install method per machine, not both: the installer warns when it finds both.
+Plugins are copied into Claude Code's cache, and their names get the plugin's prefix (`/ship:phase`, `/ship:scope`, agent `ship:phase-implementer`). Update with `/plugin marketplace update agent-skills`. Use one install method per machine, not both: the installer warns when it finds both.
 
 ## Use phase in a repo
 
@@ -55,9 +59,9 @@ Plugins are copied into Claude Code's cache, and their names get a prefix (`/pha
 ~/.claude/skills/phase/phase.py ready
 ```
 
-Then ask Claude to "run phase P0" (or `/phase P0`). Commit `.claude/phase.json` with the repo.
+Then ask Claude to "run phase P0" (or `/ship:phase P0`; `/phase P0` with `install.sh`). Commit `.claude/phase.json` with the repo.
 
-No plan yet? `/scope <brief>` writes one in `docs/plans/`; point `plan.file` and `land.progress_file` at it.
+No plan yet? `/ship:scope <brief>` writes one in `docs/plans/`; point `plan.file` and `land.progress_file` at it.
 
 ## Develop
 
@@ -66,6 +70,8 @@ No plan yet? `/scope <brief>` writes one in `docs/plans/`; point `plan.file` and
 - When a plugin changes behaviour, bump `version` in its `.claude-plugin/plugin.json`, so plugin installs pick up the update.
 
 ### Add a skill
+
+A new skill usually goes into `ship` (`plugins/ship/skills/<skill>/`, agents in `plugins/ship/agents/`) and is then `/ship:<skill>`. Make a separate plugin only for something unrelated:
 
 ```
 plugins/<name>/

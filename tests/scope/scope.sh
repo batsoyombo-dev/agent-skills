@@ -4,8 +4,8 @@
 set -uo pipefail
 
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SCOPE="$ROOT/plugins/scope/skills/scope"
-PHASE="$ROOT/plugins/phase/skills/phase/phase.py"
+SCOPE="$ROOT/plugins/ship/skills/scope"
+PHASE="$ROOT/plugins/ship/skills/phase/phase.py"
 VALIDATE="$SCOPE/scripts/validate_plan.py"
 T=$(mktemp -d "${TMPDIR:-/tmp}/scope-test.XXXXXX")
 trap '[ -n "${KEEP:-}" ] && echo "kept $T" || rm -rf "$T"' EXIT

@@ -6,7 +6,7 @@ set -uo pipefail
 unset PHASE_SESSION PHASE_SESSION_PID CLAUDE_CODE_SESSION_ID CLAUDE_PID
 
 ROOT=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PHASE="$ROOT/plugins/phase/skills/phase/phase.py"
+PHASE="$ROOT/plugins/ship/skills/phase/phase.py"
 T=$(mktemp -d "${TMPDIR:-/tmp}/phase-conc.XXXXXX")
 trap '[ -n "${KEEP:-}" ] && echo "kept $T" || rm -rf "$T"' EXIT
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.invalid GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.invalid

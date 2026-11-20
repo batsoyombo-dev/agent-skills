@@ -3,7 +3,7 @@
 
 Project-agnostic. Everything project-specific comes from <repo>/.claude/phase.json (see reference.md).
 Python 3.8+, standard library only. Run `phase.py help`.
-Source: github.com/batsoyombo-dev/agent-skills (plugins/phase).
+Source: github.com/batsoyombo-dev/agent-skills (plugins/ship/skills/phase).
 """
 
 import base64

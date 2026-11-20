@@ -66,7 +66,7 @@ In chat, keep it short:
 - the **top client questions**, ready to copy-paste. The full list stays in §7.
 - if the repo has a `CLAUDE.md`/`AGENTS.md`, suggest adding one line pointing agents to the plan file. Don't edit those files unless asked.
 
-- how to run it: `/phase P0` (or `/phase all`). If the repo has no `.claude/phase.json` yet, offer to set one up with `plan.file` and `land.progress_file` both pointing at the plan (the `phase` skill's Setup section).
+- how to run it: `/phase P0` (or `/phase all`; `/ship:phase P0` when installed as the `ship` plugin). If the repo has no `.claude/phase.json` yet, offer to set one up with `plan.file` and `land.progress_file` both pointing at the plan (the `phase` skill's Setup section).
 
 Don't restate the plan in chat.
 
