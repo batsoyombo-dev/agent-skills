@@ -86,7 +86,7 @@ The agents run in the background and you are notified as each finishes. Don't po
 Escalate when the cheaper attempt is not enough, instead of retrying at the same level:
 
 - the implementer reports BLOCKED, or hands back twice without `RESULT: PASS`: `$P tier <ID> --escalate`, then a **fresh** implementer with the new parameters and the `$P brief <ID> --write` prompt plus "Continue: the branch has N commits; read the notes file and the report first."
-- the reviewer finds a blocker or major: `$P fix-brief <ID>` already prints the escalated tier.
+- the reviewer finds a blocker or major: `$P fix-brief <ID>` prints who fixes it, and the escalated tier when that is a fresh agent.
 
 Never change a running agent's model or effort; that throws its cache away.
 
@@ -95,14 +95,13 @@ Never change a running agent's model or effort; that throws its cache away.
 1. `$P note <ID> status=review`, then `$P check <ID> --quick`. It takes seconds: every static check, plus whether review is required.
    - FAIL: send the lines back to the same agent (SendMessage), or fix small things in the worktree yourself, commit, and check again.
 2. If it printed `review required (...)`, start a `phase-reviewer` agent in the background now, description `<ID>: review`, with the prompt and Agent parameters that `$P review-brief <ID> --write` prints. It has the diff and the spec as files, so the reviewer starts judging at once. Don't add your own conclusions, and never tell it what not to flag.
-3. While it reviews, **run the full gate yourself**: `$P check <ID>`. Don't trust the report. Test commands that already passed on this exact commit are not re-run (the record is phase.py's own, and merge runs the full suite again); everything else is checked again. A fix commit needs the gate again, and a new approval.
+3. While it reviews, **run the full gate yourself**: `$P check <ID>`. Don't trust the report. Test commands that already passed on this exact commit are not re-run (the record is phase.py's own, and merge tests every combination that commit was not tested in); everything else is checked again. A fix commit needs the gate again, and a new approval.
 4. Read the work:
    - With a reviewer: read the report and the verdict, not the whole diff and not the findings file. The reviewer reads it line by line in its own context; reading it twice only fills yours.
    - Without one: read the diff against the spec and the report (the diff command is in `$P review-brief <ID>`), and check each done-when point.
 5. Reviewer verdicts:
    - **Blockers and majors** are fixed before merge, in one round with all of them:
-     - the implementer finished less than 4 minutes ago: SendMessage it the finding numbers and the findings path (its cache is still warm).
-     - otherwise a **fresh** implementer, description `<ID>: fix`, with the prompt and parameters from `$P fix-brief <ID> [--only 1,3]`. Waking an agent with a long, cold context costs more than starting one that reads only what the findings name.
+     - `$P fix-brief <ID> [--only 1,3]` decides who fixes them and prints the message. `Resume the implementer`: SendMessage it at once, since its cache stays warm for minutes only. `Fresh agent`: start an implementer, description `<ID>: fix`, with the printed prompt and parameters. Follow what it prints: a warm agent already knows the code, a cold one costs more to wake than a fresh one, and a blocker gets a stronger pair of eyes. Run it as soon as the verdict arrives, before the minors.
      - Then gate again. After a blocker, `$P review-brief <ID> --recheck` gives a reviewer only the fix commits.
    - **Minors never start a round.** `$P minor <ID> "<file:line: what goes wrong → fix>"` for each, and merge. If you think a minor is really about visibility, rights, lost data or two users at once, treat it as major.
    - A finding you judge wrong: say why in the approve note.
@@ -115,6 +114,8 @@ Never change a running agent's model or effort; that throws its cache away.
 ```bash
 $P merge <ID>      # squash onto a fresh base in <worktrees>/_integration and run the full checks
 ```
+
+When the base has not moved under the branch, the squash is the very tree the gate tested; with `gate.merge_min` set, merge then runs only those commands in its clean checkout. Any other merge runs everything (`--full` forces it).
 
 - `CONFLICT`: `$P sync <ID> --keep`, resolve in the task worktree, `git rebase --continue`, `$P check <ID>`, merge again. For a non-trivial conflict, send it back to the implementer.
 - Checks red after the squash: the task collides with something landed since it was cut. Sync, fix, check, merge.
@@ -151,7 +152,7 @@ Finish with a short summary:
 
 - tasks landed (commit shas)
 - where the time went: the slowest step per task from `$P stats`, when one stands out
-- what it cost: the per-task line of `$P cost <IDs>`, and any task that cost much more than the others or needed escalation (its tier, or its size, is wrong in the plan)
+- what it cost: the per-task line of `$P cost <IDs>`, any agent it shows as COMPACTED, and any task that cost much more than the others or needed escalation (its tier, or its size, is wrong in the plan)
 - open minors (`$P minors`)
 - deploy and smoke results
 - decisions made

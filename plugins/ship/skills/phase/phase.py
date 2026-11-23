@@ -7,6 +7,7 @@ Source: github.com/batsoyombo-dev/agent-skills (plugins/ship/skills/phase).
 """
 
 import base64
+import contextlib
 import datetime
 import fcntl
 import fnmatch
@@ -77,6 +78,8 @@ DEFAULTS = {
     "gate": {
         "tests": [],
         "test_timeout": 1800,
+        "slots": 0,
+        "merge_min": None,
         "conditional": [],
         "per_file": [],
         "forbid": [
@@ -994,8 +997,37 @@ def test_commands(proj, repo, paths):
     return cmds
 
 
+@contextlib.contextmanager
+def test_slot(proj, repo):
+    """At most gate.slots test runs at once: agents' gates that compete for the CPU make slow tests time out."""
+    g = proj.rcfg(repo, "gate")
+    t0, held = time.time(), None
+    while g["slots"] and held is None and time.time() - t0 < g["test_timeout"]:
+        for n in range(1, g["slots"] + 1):
+            lock = FileLock(os.path.join(proj.state_dir, "test-slot-%d.lock" % n), "test slot", 0)
+            try:
+                held = lock.__enter__()
+                break
+            except Busy:
+                pass
+        else:
+            time.sleep(0.5)
+    if time.time() - t0 > 5:
+        info("waited %s for a test slot (gate.slots: %d)" % (dur(time.time() - t0), g["slots"]))
+    try:
+        yield
+    finally:
+        if held:
+            held.__exit__()
+
+
 def run_tests(proj, repo, wt, c, cmds, log):
     """Run test commands in wt; returns (ok, summary)."""
+    with test_slot(proj, repo):
+        return run_commands(proj, repo, wt, c, cmds, log)
+
+
+def run_commands(proj, repo, wt, c, cmds, log):
     with open(log, "w") as fh:
         for cmd in cmds:
             shown = proj.fmt(cmd, c)
@@ -1476,7 +1508,7 @@ def cmd_brief(proj, args):
         lines += ["", "Project rules:"] + ["- " + proj.fmt(r, c) for r in b["rules"]]
     lines += [
         "",
-        "Gate: %s check %s   (must end with RESULT: PASS before you report)" % (proj.script, task),
+        "Gate: %s check %s   (must end with RESULT: PASS before you report; run it with a 10-minute Bash timeout)" % (proj.script, task),
         "Sync: %s sync %s    (when the gate says you are behind, or the orchestrator says staging moved)" % (proj.script, task),
         "Report: %s/%s" % (c["wt"], REPORT),
         "Notes: %s   (your working notes; they survive compaction, and a later agent starts from them)"
@@ -1504,8 +1536,8 @@ def cmd_brief(proj, args):
         name = st.get("tier") or tier_name(proj, row if row["id"] == task and "phase" in row else {"id": task})
         print("Agent parameters: %s (tier %s)" % (tier_params(proj, name), name))
         print("Prompt:")
-        print("You are the implementer for task %s (%s). Your complete brief is %s (%d KB): read the whole file first, in as "
-              "few Read calls as possible, and follow it exactly.\nContext from other tasks: none"
+        print("You are the implementer for task %s (%s). Your complete brief is %s (%d KB): read the whole file first with one Read "
+              "call (shell output is cut at 30,000 characters), and follow it exactly.\nContext from other tasks: none"
               % (task, row["task"], path, os.path.getsize(path) // 1024))
         return 0
     print("\n".join(lines))
@@ -1644,8 +1676,38 @@ def cmd_review_brief(proj, args):
           % (path, os.path.getsize(path) // 1024, findings))
 
 
+WARM = 240  # seconds: the 5-minute prompt cache, less the time it takes to send the message
+
+
+def transcripts_root(proj):
+    slug = re.sub(r"[^A-Za-z0-9]", "-", proj.main)
+    return os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects", slug)
+
+
+def idle_secs(proj, st):
+    """Seconds since the task's implementer made its last call, or None when it can't be told."""
+    agent = st.get("agent") or ""
+    if not re.match(r"^[A-Za-z0-9_-]+$", agent):
+        return None
+    found = glob.glob(os.path.join(transcripts_root(proj), "*", "subagents", "agent-%s.jsonl" % re.sub("^agent-", "", agent)))
+    return time.time() - max(map(os.path.getmtime, found)) if found else None
+
+
+def has_blocker(path, only):
+    """Whether the findings to fix mention a blocker. A finding runs from its number to the next one; the word in its prose
+    counts too, because a fresh, stronger agent is the safe side of a doubt."""
+    want, current = {x.strip() for x in only.split(",")} if only else None, None
+    for line in open(path, encoding="utf-8", errors="replace"):
+        m = re.match(r"^[*_#\s]{0,6}(\d+)[.)]\s", line)
+        current = m.group(1) if m else current
+        if current and (want is None or current in want) and re.search(r"\bblocker\b", line, re.I):
+            return True
+    return False
+
+
 def cmd_fix_brief(proj, args):
-    """Prompt for a fresh agent that fixes review findings, without the first implementer's long context."""
+    """Who fixes the review findings, and the prompt: the implementer while its cache is warm, else a fresh agent
+    that does not carry its long context."""
     st = proj.state(args.task)
     if not st:
         die("unknown task " + args.task)
@@ -1653,7 +1715,35 @@ def cmd_fix_brief(proj, args):
     files = sorted(glob.glob(os.path.join(d, "findings-*.md")))
     if not files:
         die("no findings file in %s (the reviewer writes it)" % d)
-    name = proj.cfg["agents"]["escalate_tier"] or st.get("tier") or tier_name(proj, find_task(proj, task) or {"id": task})
+    built = st.get("tier") or tier_name(proj, find_task(proj, task) or {"id": task})
+    name = proj.cfg["agents"]["escalate_tier"] or built
+    tiers = proj.cfg["agents"]["tiers"]
+    model = lambda t: (tiers.get(t) or {}).get("model") or "inherit"  # noqa: E731
+    idle = idle_secs(proj, st)
+    if args.fresh:
+        why = "--fresh"
+    elif idle is None:
+        why = "no transcript of the implementer"
+    elif idle > WARM:
+        why = "the implementer has been idle for %s, so its cache is cold" % dur(idle)
+    elif has_blocker(files[-1], args.only):
+        why = "a blocker"
+    elif model(built) != model(name):
+        why = "built on %s, fixes need %s" % (model(built), model(name))
+    else:
+        print("Resume the implementer (idle for %s, its cache is warm): SendMessage to %s now, don't start an agent."
+              % (dur(idle), st["agent"]))
+        print("Message:")
+        print("\n".join([
+            "The review of %s found defects. Fix %s of %s; read that file first."
+            % (task, "finding(s) " + args.only if args.only else "every blocker and major", files[-1]),
+            "Each fix gets a test that fails without it. If a finding is wrong, change nothing for it and say why.",
+            "One commit `%s: review fixes`. Then run the gate until RESULT: PASS: %s check %s" % (task, proj.script, task),
+            "Append a `## Review fixes` section to the report (finding → fix → test). Reply with the tip sha, the RESULT "
+            "line and one line per finding.",
+        ]))
+        return 0
+    print("Fresh agent (%s)." % why)
     print("Agent parameters: %s (tier %s)" % (tier_params(proj, name), name))
     print("Prompt:")
     print("\n".join([
@@ -1704,10 +1794,12 @@ PRICES = {"claude-opus-5-5": (4, 20, .2), "claude-sonnet-5-5": (2, 10, .1), "cla
 
 
 def transcript_cost(path):
-    """Calls, largest context, output tokens, price, models and effort of one Claude Code transcript."""
-    seen, effort = {}, ""
+    """Calls, largest context, output tokens, price, models and effort of one Claude Code transcript, and its compactions.
+    A compaction is a call of its own that the transcript has no usage for: priced here as a cached read of the context
+    plus the summary it wrote, so it is a floor."""
+    seen, effort, pre, summary, last = {}, "", [], 0, ""
     for line in open(path, encoding="utf-8", errors="replace"):
-        if '"usage"' not in line and '"effort"' not in line:
+        if not any(k in line for k in ('"usage"', '"effort"', '"compact_boundary"', '"isCompactSummary"')):
             continue
         try:
             o = json.loads(line)
@@ -1716,10 +1808,16 @@ def transcript_cost(path):
         if o.get("type") == "api-request":
             effort = ((o.get("params") or {}).get("output_config") or {}).get("effort") or effort
         m = o.get("message")
+        if o.get("subtype") == "compact_boundary":
+            pre.append((o.get("compactMetadata") or {}).get("preTokens") or 0)
+        elif o.get("isCompactSummary") and isinstance(m, dict):
+            body = m.get("content")
+            summary += len(body if isinstance(body, str) else "".join(b.get("text") or "" for b in body or []))
         if o.get("type") == "assistant" and isinstance(m, dict) and m.get("id"):
             seen[m["id"]] = (m.get("model") or "", m.get("usage") or {})
+            last = last if (m.get("model") or "<").startswith("<") else m["model"]
     n = lambda u, k: u.get(k) or 0  # noqa: E731
-    ctx = out = 0
+    ctx, out = max(pre or [0]), 0
     usd, priced, models = 0.0, True, set()
     for model, u in seen.values():
         if model.startswith("<"):
@@ -1737,16 +1835,18 @@ def transcript_cost(path):
             continue
         usd += (price[0] * (n(u, "input_tokens") + 1.25 * w5 + 2 * w1) + price[1] * n(u, "output_tokens")
                 + price[2] * n(u, "cache_read_input_tokens")) / 1e6
-    return {"calls": len(seen), "ctx": ctx, "out": out, "usd": usd if priced else None, "models": models, "effort": effort}
+    price = PRICES.get(last, (0, 0, 0))
+    extra = (price[2] * sum(pre) + price[1] * summary / 4) / 1e6 if pre else 0.0
+    return {"calls": len(seen), "ctx": ctx, "out": out, "usd": usd + extra if priced else None, "models": models,
+            "effort": effort, "compactions": len(pre), "compact_usd": extra}
 
 
 def cmd_cost(proj, args):
     """What each task's agents cost, from Claude Code's transcripts (agent descriptions start with `<ID>:`)."""
-    slug = re.sub(r"[^A-Za-z0-9]", "-", proj.main)
-    root = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects", slug)
+    root = transcripts_root(proj)
     want = [norm_id(t) for t in args.task]
     known = {norm_id(st["task"]): st for st in proj.states() if st.get("task")}
-    rows, totals = [], {}
+    rows, totals, sessions, compact = [], {}, {}, [0, 0.0]
     for meta in sorted(glob.glob(os.path.join(root, "*", "subagents", "agent-*.meta.json")), key=os.path.getmtime):
         try:
             d = json.load(open(meta, encoding="utf-8"))
@@ -1767,16 +1867,28 @@ def cmd_cost(proj, args):
         role = re.sub(r"^(ship:)?phase-", "", d.get("agentType") or "?")
         rows.append([known[tid]["task"], role, ",".join(sorted(x.replace("claude-", "") for x in t["models"])) or "-",
                      t["effort"] or "-", t["calls"], "%dk" % (t["ctx"] // 1000), "%dk" % (t["out"] // 1000),
-                     "$%.2f" % t["usd"] if t["usd"] is not None else "-"])
+                     str(t["compactions"] or "-"), "$%.2f" % t["usd"] if t["usd"] is not None else "-"])
         totals.setdefault(known[tid]["task"], []).append(t["usd"] or 0)
+        compact[0] += t["compactions"]
+        compact[1] += t["compact_usd"]
+        sessions[os.path.basename(os.path.dirname(os.path.dirname(meta)))] = 1
     if not rows:
         print("no agent transcripts found under %s" % root)
         return 0
-    print_table(["TASK", "ROLE", "MODEL", "EFFORT", "CALLS", "MAX CTX", "OUTPUT", "API PRICE"], rows)
+    print_table(["TASK", "ROLE", "MODEL", "EFFORT", "CALLS", "MAX CTX", "OUTPUT", "COMPACTED", "API PRICE"], rows)
     print("\nper task: " + ", ".join("%s $%.2f" % (k, sum(v)) for k, v in totals.items()))
     print("total: $%.2f for %d task(s), $%.2f each (API prices; a subscription counts usage its own way; the "
           "orchestrator's own turns are not included)"
           % (sum(map(sum, totals.values())), len(totals), sum(map(sum, totals.values())) / len(totals)))
+    if compact[0]:
+        print("compactions: %d, at least $%.2f of the total, and each makes the agent re-read; a task that compacts is too "
+              "big, or the agents' autoCompactWindow is too small" % (compact[0], compact[1]))
+    for sid in sessions:
+        path = os.path.join(root, sid + ".jsonl")
+        if os.path.isfile(path):
+            t = transcript_cost(path)
+            print("orchestrator session %s: %s, %d calls, max context %dk (the whole session, all its tasks and other work)"
+                  % (sid[:8], "$%.2f" % t["usd"] if t["usd"] is not None else "-", t["calls"], t["ctx"] // 1000))
 
 
 def cmd_note(proj, args):
@@ -2066,7 +2178,7 @@ def cmd_check(proj, args):
             tests_secs = int(time.time() - t1)
             P(summary) if okk else F(summary)
             if okk and not dirty:
-                proj.save(task, tests_pass={"sha": head, "at": now()})
+                proj.save(task, tests_pass={"sha": head, "at": now(), "cmds": cmds})
         else:
             W("no gate.tests configured")
         report = os.path.join(wt, REPORT)
@@ -2086,6 +2198,15 @@ def cmd_check(proj, args):
     proj.event(task, "check", ok=False, **timing)
     print("RESULT: FAIL (%d failure(s), %d warning(s))" % (fails[0], warns[0]))
     return 1
+
+
+def already_tested(proj, repo, st, iw, tip, cmds):
+    """Whether phase.py saw exactly these commands pass on exactly the files the squash gives: the base has not moved
+    under the branch, the trees are identical, and the gate ran the same commands on the tip."""
+    prev = st.get("tests_pass") or {}
+    return (proj.rcfg(repo, "gate")["merge_min"] is not None and prev.get("sha") == tip and prev.get("cmds") == cmds
+            and git(iw, "merge-base", tip, "HEAD") == git(iw, "rev-parse", "HEAD")
+            and git(iw, "write-tree") == git(iw, "rev-parse", tip + "^{tree}"))
 
 
 def cmd_merge(proj, args):
@@ -2125,8 +2246,14 @@ def cmd_merge(proj, args):
     c.update({"wt": iw, "id": "integration", "port": proj.cfg["slots"]["port_base"] - 1})
     run_hooks(proj, c, proj.rcfg(repo, "worktree")["refresh"], "refresh", iw)
     paths = git(iw, "diff", "--cached", "--name-only").splitlines()
-    okk, summary = run_tests(proj, repo, iw, c, test_commands(proj, repo, paths),
-                             os.path.join(proj.state_dir, norm_id(task) + ".merge.log"))
+    cmds = test_commands(proj, repo, paths)
+    reused = not args.full and already_tested(proj, repo, st, iw, tip, cmds)
+    if reused:
+        # A clean checkout still has to build: a file the task forgot to commit passes its own gate and nothing else.
+        cmds = proj.rcfg(repo, "gate")["merge_min"]
+    okk, summary = run_tests(proj, repo, iw, c, cmds, os.path.join(proj.state_dir, norm_id(task) + ".merge.log"))
+    if reused:
+        summary = "same files as the gate tested at %s, so only gate.merge_min ran; %s" % (st["tests_pass"]["at"], summary)
     if not okk:
         git(iw, "reset", "-q", "--hard", proj.base_ref())
         proj.event(task, "merge", result="red", secs=int(time.time() - t0))
@@ -2134,7 +2261,7 @@ def cmd_merge(proj, args):
         print("The task was green alone, so it collides with something landed since it was cut: sync, fix, check, merge")
         return 1
     proj.save(task, status="merging", merge_onto=git(iw, "rev-parse", "HEAD"))
-    proj.event(task, "merge", result="ok", secs=int(time.time() - t0))
+    proj.event(task, "merge", result="ok", secs=int(time.time() - t0), **({"reused": True} if reused else {}))
     pf = proj.cfg["land"]["progress_file"]
     piw = proj.int_wt(proj.primary)
     print("ok    squash of %s staged on %s @ %s; %s" % (br, proj.base_ref(), git(iw, "rev-parse", "--short", "HEAD"), summary))
@@ -2526,7 +2653,8 @@ Plan
   tier <ID> [--escalate]      model and effort for the task's implementer and reviewer; --escalate moves it up
   review-brief <ID> [--write] reviewer prompt. --write makes a package: brief with the spec text, and the diff in parts
       [--recheck]             --recheck: only the fix commits since the last package
-  fix-brief <ID> [--only N,M] prompt for a fresh agent that fixes the reviewer's findings (default: blockers and majors)
+  fix-brief <ID> [--only N,M] who fixes the reviewer's findings (default: blockers and majors) and the message: the
+                              implementer while its cache is warm, else a fresh agent (--fresh forces one)
   minor <ID> "<text>"         keep a minor finding for a later batch; `minors [--all] [--close N ...]` lists and closes
 Work
   add <ID> [--repo NAME]      worktree + branch phase/<id> from the base, env, slot/port, setup hooks; resumes.
@@ -2535,7 +2663,8 @@ Work
   status [--all]              every task: status, agent, ahead/behind, tree, gate, review need, last commit
   overlap                     files touched by more than one active task, or by the base since a task was cut
   stats [ID ...]              where the time went per task: build, gate runs, review wait, merge, land
-  cost [ID ...] [--days N]    what each agent cost, from Claude Code's transcripts: calls, largest context, price
+  cost [ID ...] [--days N]    what each agent cost, from Claude Code's transcripts: calls, largest context,
+                              compactions, price
   sync <ID> [--keep]          rebase the task onto the base (aborts on conflict unless --keep), refresh hooks
   check <ID> [--quick|--full] the gate: forbidden/owned/immutable files, rules, secrets, tests changed, skip
                               markers, per-file checks, test commands. Test commands that already passed on
@@ -2545,7 +2674,8 @@ Work
   mark <ID> [STATUS]          after merge: set the task's status in the plan (block Status line, ticks its
                               criteria; or the table's status cell). Default "done" / "done <date>"
 Land (orchestrator only, one task at a time)
-  merge <ID>                  squash onto a fresh base in <worktrees>/_integration and run the checks
+  merge <ID> [--full]         squash onto a fresh base in <worktrees>/_integration and run the checks (only
+                              gate.merge_min when the gate tested exactly this tree)
   land <ID> "<message>"       commit with the progress edit and push (secondary repo: its commit, then a
                               primary progress commit with {sha} filled in). Resumable after a failed push
   abort                       drop a staged merge
@@ -2591,6 +2721,7 @@ def main(argv):
         sub.add_argument("--recheck", action="store_true")
     if cmd == "fix-brief":
         sub.add_argument("--only")
+        sub.add_argument("--fresh", action="store_true")
     if cmd == "minor":
         sub.add_argument("text")
     if cmd == "minors":
@@ -2617,6 +2748,8 @@ def main(argv):
         sub.add_argument("--keep", action="store_true")
     if cmd == "check":
         sub.add_argument("--quick", action="store_true")
+        sub.add_argument("--full", action="store_true")
+    if cmd == "merge":
         sub.add_argument("--full", action="store_true")
     if cmd == "land":
         sub.add_argument("message")

@@ -361,6 +361,69 @@ has "land fast-forwards the local base" "$(P land T0.1 'T0.1: x')" "landed T0.1"
 has "checked-out base moved and is clean" "$(git status --porcelain | wc -l | tr -d ' ') $(ls x.txt 2>/dev/null)" "^0 x.txt$"
 has "T0.2 ready after T0.1" "$(P ready)" "T0.2 .*ready"
 
+# ---------------------------------------------------------------- merge reuse, test slots, fix-brief, cost
+echo "merge reuse, test slots, fix-brief, cost"
+git init -q -b staging "$T/eff" && cd "$T/eff" && mkdir -p docs .claude
+export CLAUDE_CONFIG_DIR="$T/claude"
+printf '**P0: Base**\n\n| Id | Task | Depends on | Owner | Status | Tier |\n|---|---|---|---|---|---|\n| T1 | One | — | agent | | |\n| T2 | Two | — | agent | | |\n| T3 | Three | — | agent | | small |\n| T4 | Four | — | agent | | |\n| T5 | Five | — | agent | | |\n' > docs/progress.md
+printf 'echo full >> "%s/runs.log"\n' "$T" > t.sh; printf 'echo min >> "%s/runs.log"; test ! -e need.txt || test -e lib.txt\n' "$T" > m.sh
+cat > .claude/phase.json <<'EOF'
+{"remote": null, "plan": {"file": "docs/progress.md"}, "worktree": {"env_file": ""},
+ "agents": {"tiers": {"big": {"model": "opus", "effort": "high"}, "mid": {"model": "opus", "effort": "medium"}, "small": {"model": "sonnet"}},
+            "default_tier": "mid", "escalate_tier": "big"},
+ "gate": {"tests": ["bash t.sh"], "merge_min": ["bash m.sh"], "slots": 1, "review": {"lines": 0}}, "land": {"progress_file": "docs/progress.md"}}
+EOF
+git add -A && git commit -qm init
+runs() { tr '\n' ' ' < "$T/runs.log"; : > "$T/runs.log"; }
+task() { P add "$1" >/dev/null; ( cd ".worktrees/$(echo "$1" | tr A-Z a-z)" && echo "$1" > "$1.txt" && git add -A && git commit -qm "$1: x" ); }
+task T1; task T2; task T4; : > "$T/runs.log"
+P check T1 >/dev/null; P approve T1 >/dev/null; has "the gate runs the tests" "$(runs)" "^full $"
+out=$(P merge T1); has "identical tree: merge says what it skipped" "$out" "same files as the gate tested"; has "identical tree: only merge_min runs" "$(runs)" "^min $"
+P mark T1 >/dev/null; has "reused merge lands" "$(P land T1 'T1: x')" "landed T1"
+P check T2 >/dev/null; P approve T2 >/dev/null; runs >/dev/null
+hasnt "moved base: nothing is skipped" "$(P merge T2)" "same files as the gate"; has "moved base: the full checks run" "$(runs)" "^full $"
+P abort >/dev/null
+P sync T2 >/dev/null; P check T2 >/dev/null; P approve T2 >/dev/null; runs >/dev/null
+has "synced onto the new base: skipped again" "$(P merge T2)" "same files as the gate tested"; P abort >/dev/null; runs >/dev/null
+hasnt "merge --full skips nothing" "$(P merge T2 --full)" "same files as the gate"; has "merge --full runs the tests" "$(runs)" "^full $"
+P abort >/dev/null
+edit 's/"bash t.sh"/"bash t.sh", "true"/' .claude/phase.json
+hasnt "other commands than the gate ran: nothing is skipped" "$(P merge T2)" "same files as the gate"; P abort >/dev/null; git checkout -q .claude/phase.json
+( cd .worktrees/t4 && printf 'lib.txt\n' > .gitignore && echo x > need.txt && echo x > lib.txt && git add -A && git commit -qm "T4: forgot lib.txt" )
+P sync T4 >/dev/null; has "own gate misses the ignored file" "$(P check T4)" "RESULT: PASS"; P approve T4 >/dev/null
+has "merge_min in the clean checkout catches it" "$(P merge T4)" "FAIL +full checks after the squash"
+
+python3 - "$T/eff/.worktrees/.phase/test-slot-1.lock" <<'EOF' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT); fcntl.flock(fd, fcntl.LOCK_EX); time.sleep(8)
+EOF
+holder=$!; sleep 1; out=$(P check T2 --full); wait "$holder" 2>/dev/null
+has "a full machine makes the gate wait for a slot" "$out" "waited .* for a test slot \(gate.slots: 1\)"; has "then it passes" "$out" "RESULT: PASS"
+
+sess="$CLAUDE_CONFIG_DIR/projects/$(cd "$T/eff" && pwd -P | sed 's/[^A-Za-z0-9]/-/g')/s1/subagents"; mkdir -p "$sess"
+task T3; P add T5 >/dev/null
+for t in T2 T3; do mkdir -p ".worktrees/.phase/$(echo $t | tr A-Z a-z).review"; printf 'VERDICT: CHANGES\n1. `a.ts:1` - major\n   wrong\n2. `b.ts:1`\n   - severity: blocker\n' > ".worktrees/.phase/$(echo $t | tr A-Z a-z).review/findings-1.md"; done
+P note T2 agent=ag2 >/dev/null; P note T3 agent=ag3 >/dev/null
+has "no transcript: a fresh agent" "$(P fix-brief T2 --only 1)" "Fresh agent \(no transcript"
+cat > "$sess/agent-ag2.jsonl" <<'EOF'
+{"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":0,"cache_creation_input_tokens":100000,"cache_read_input_tokens":0,"output_tokens":1000}}}
+{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto","preTokens":200000}}
+{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"SUMMARY"}}
+EOF
+echo '{"agentType":"phase-implementer","description":"T2: two"}' > "$sess/agent-ag2.meta.json"
+cp "$sess/agent-ag2.jsonl" "$sess/agent-ag3.jsonl"
+out=$(P fix-brief T2 --only 1); has "warm: resume the implementer" "$out" "Resume the implementer .* SendMessage to ag2"; has "resume names the finding" "$out" "Fix finding\(s\) 1 of"; hasnt "resume starts no agent" "$out" "Agent parameters"
+has "a blocker gets a fresh agent" "$(P fix-brief T2)" "Fresh agent \(a blocker\)"
+has "fresh agent has the escalated tier" "$(P fix-brief T2)" "Agent parameters: model: opus, effort: high"
+has "--fresh forces one" "$(P fix-brief T2 --only 1 --fresh)" "Fresh agent \(--fresh\)"
+has "a weaker model is not resumed" "$(P fix-brief T3 --only 1)" "Fresh agent \(built on sonnet, fixes need opus\)"
+touch -t 202001010000 "$sess/agent-ag2.jsonl"; has "cold: a fresh agent" "$(P fix-brief T2 --only 1)" "Fresh agent \(the implementer has been idle"
+touch "$sess/agent-ag2.jsonl"; printf '{"type":"assistant","message":{"id":"o1","model":"claude-opus-5-5","usage":{"input_tokens":0,"cache_read_input_tokens":50000,"output_tokens":0}}}\n' > "$(dirname "$(dirname "$sess")")/s1.jsonl"
+out=$(P cost T2); has "cost counts compactions and the context they cut" "$out" "T2 +implementer +opus-5-5 +- +1 +200k +1k +1 +\\\$0.56"
+has "cost says what compacting cost" "$out" "compactions: 1, at least \\\$0.04"; has "cost prices the orchestrator session" "$out" "orchestrator session s1: \\\$0.01, 1 calls"
+has "brief asks for one Read call" "$(P brief T5 --write)" "with one Read call"
+unset CLAUDE_CONFIG_DIR
+
 echo
 echo "phase e2e: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -58,6 +58,8 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `worktree.exclude` | extra paths for `.git/info/exclude` (generated config files) |
 | `gate.tests` | commands that must pass, run in the worktree for `check` and in the integration worktree for `merge` |
 | `gate.test_timeout` | seconds before one test command is killed (default 1800) |
+| `gate.slots` | how many test runs (`check`, `merge`) may go at once on this machine (default 0: no limit). Agents' gates that compete for the CPU make slow tests hit their timeouts; 2 is a good value with parallel test runners |
+| `gate.merge_min` | commands `merge` runs when the squash is exactly the tree the gate already tested with the same commands, and the base has not moved under the branch (default null: always run everything). Type check and build are the useful ones: a file the task forgot to commit passes its own gate but not a clean checkout. `[]` runs nothing. `merge --full` runs everything |
 | `gate.conditional` | `[{when: regex on changed paths, run: [commands]}]`, e.g. integration tests when the schema changed |
 | `gate.per_file` | `[{glob, run, name}]` run on each added or modified file (`{file}`), e.g. a syntax check |
 | `gate.forbid` | globs that must never be committed (defaults cover env files, keys, `node_modules`, the report); `forbid_allow` lists exceptions |
@@ -123,7 +125,7 @@ Briefs, notes, review packages (`<id>.brief.md`, `<id>.notes.md`, `<id>.review/`
 
 ## Cost
 
-`phase.py cost [ID ...] [--days N]` reads Claude Code's transcripts of this project (`$CLAUDE_CONFIG_DIR` or `~/.claude`) and prints, per agent, the model, effort, calls, largest context, output tokens and the price at API rates (`PRICES` in phase.py; `-` for a model not listed). It finds agents by their description, which must start with `<ID>:`. Compare a new tier or a config change with it before rolling it out: look at price per landed task, fix agents included, next to the review findings.
+`phase.py cost [ID ...] [--days N]` reads Claude Code's transcripts of this project (`$CLAUDE_CONFIG_DIR` or `~/.claude`) and prints, per agent, the model, effort, calls, largest context, output tokens, compactions and the price at API rates (`PRICES` in phase.py; `-` for a model not listed). It finds agents by their description, which must start with `<ID>:`. A compaction is a call without usage in the transcript, so its price is a floor: a cached read of the context plus the summary. With cache reads at a twentieth of the input price, compacting a run of a few dozen calls costs more than it saves, so the agents' `autoCompactWindow` is a safety net, not a saving. The last lines price each orchestrator session as a whole. Compare a new tier or a config change with it before rolling it out: look at price per landed task, fix agents included, next to the review findings.
 
 ## Timing
 
