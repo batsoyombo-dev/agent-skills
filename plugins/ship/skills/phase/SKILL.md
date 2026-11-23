@@ -104,7 +104,8 @@ Never change a running agent's model or effort; that throws its cache away.
      - `$P fix-brief <ID> [--only 1,3]` decides who fixes them and prints the message. `Resume the implementer`: SendMessage it at once, since its cache stays warm for minutes only. `Fresh agent`: start an implementer, description `<ID>: fix`, with the printed prompt and parameters. Follow what it prints: a warm agent already knows the code, a cold one costs more to wake than a fresh one, and a blocker gets a stronger pair of eyes. Run it as soon as the verdict arrives, before the minors.
      - Then gate again. After a blocker, `$P review-brief <ID> --recheck` gives a reviewer only the fix commits.
    - **Minors never start a round.** `$P minor <ID> "<file:line: what goes wrong → fix>"` for each, and merge. If you think a minor is really about visibility, rights, lost data or two users at once, treat it as major.
-   - A finding you judge wrong: say why in the approve note.
+   - A finding you judge wrong: say why in the approve note, and drop its lesson (`$P lessons --drop <n>`).
+   - `approve` collects the `Lesson:` lines of the findings; implementer and review briefs carry the newest ones. Record one yourself when a gate, merge or smoke failure taught something general: `$P lesson <ID> "<rule>"`. When a lesson has become a project rule, move it to the project's docs or `review.checklist` with the user's OK, and drop it.
    - Then record it: `$P approve <ID> --note "<reviewer APPROVE, or which findings you verified fixed>"`. Merge refuses a required review without an approval for the current tip, so a new commit needs a new approval.
 
 6. No browser, device or visual checks during the run, by you or by any agent: they stall the queue. Collect the screens each task changed (from the reports' "Needs the user") into the final summary, for the user to look at.
@@ -152,7 +153,7 @@ Finish with a short summary:
 
 - tasks landed (commit shas)
 - where the time went: the slowest step per task from `$P stats`, when one stands out
-- what it cost: the per-task line of `$P cost <IDs>`, any agent it shows as COMPACTED, and any task that cost much more than the others or needed escalation (its tier, or its size, is wrong in the plan)
+- what it cost: the per-task line of `$P cost <IDs>`, any agent it shows as COMPACTED or working one action at a time, new lessons (`$P lessons`), and any task that cost much more than the others or needed escalation (its tier, or its size, is wrong in the plan)
 - open minors (`$P minors`)
 - deploy and smoke results
 - decisions made

@@ -36,6 +36,7 @@ Write the full review to the findings file your brief names (with a Bash heredoc
 - severity: blocker (must fix before merge), major (fix before merge unless the orchestrator records why not), or minor (recorded for a later batch, so it will not be fixed before merge). Anything that shows data to someone who may not see it, lets someone do what they may not, loses or corrupts data, or breaks under two users at once is at least major, however unlikely. So is a test that cannot fail for a listed done-when point.
 - what goes wrong, with a concrete input or scenario
 - the fix, in one or two lines
+- for a blocker or major only, when the mistake could happen again elsewhere: a line `Lesson: <a general rule that would have prevented it, at most 25 words, no file names>`. Later briefs carry it. Leave it out when the checklist or an earlier lesson already says it.
 
 End with one line listing what you did not check. If there are no real defects, say APPROVE and name what you verified. CHANGES means at least one blocker or major.
 

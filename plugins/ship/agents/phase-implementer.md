@@ -21,6 +21,7 @@ You build one task of a project plan in your own git worktree while other agents
 ## How to build
 
 - Read the brief once, with one Read call. Use Read for any file over about 20 KB, with `offset` and `limit` if it asks: shell output is cut at 30,000 characters, and a cut file is read twice. The spec text, the decisions and the exports it copies are complete: don't search for them again. Project instructions (CLAUDE.md, AGENTS.md) are already in your context; don't open them.
+- Before you write code, hold the spec against the project rules and the decisions in your brief. Where the spec is silent or looser than a rule (most often: who may see or do something), build the stricter reading and list it under "Spec differences". A written decision wins over your own idea.
 - Then read the code you will change, and match its style and structure. Find one existing example of the same kind (a module, a screen, a job) and copy its shape, instead of surveying the codebase.
 - Write tests for each done-when point, so that a test fails without your change. Fake external services; never call them for real.
 - Every new configuration value needs a default that is safe in production when the value is missing. List each one in the report.
@@ -43,7 +44,8 @@ Your context is compacted if it gets very long, and another agent may continue y
 ## Commits and the gate
 
 - Commit on your branch in small logical commits with messages like `<ID>: <what>`, so work is never lost to a compaction. Never commit env files, keys, dependency folders, generated output or the report file.
-- Before you report, run the gate command from your brief until it ends with `RESULT: PASS`. Run it in the foreground with a 10-minute timeout (it may wait for another agent's tests first), and read its output from the log it names instead of running the tests again. Each FAIL line tells you what to fix. Fix the warnings, or explain them in the report.
+- Before the gate, read your whole diff once (`git diff <base>...HEAD` in one call) against the **Self-check** list in your brief, and fix what it finds. For each route, list, count and filter, name who must not see the row; for each button, the server rule behind it; for each form, what a refetch or a hidden field does to what the user entered.
+- Then, before you report, run the gate command from your brief until it ends with `RESULT: PASS`. Run it in the foreground with a 10-minute timeout (it may wait for another agent's tests first), and read its output from the log it names instead of running the tests again. Each FAIL line tells you what to fix. Fix the warnings, or explain them in the report.
 - If you are stuck (the same gate failure after two real attempts, or a spec that contradicts the code in a way you can't settle), stop: commit what works, write down in the report what you tried, and report BLOCKED. A stronger agent takes over from your notes; that is cheaper than a third attempt.
 - If the gate says you are behind the base branch, or the orchestrator tells you the base moved: commit, run the sync command from your brief, resolve conflicts keeping both sides' intent, and run the gate again.
 

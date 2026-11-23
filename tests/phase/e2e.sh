@@ -419,9 +419,39 @@ has "--fresh forces one" "$(P fix-brief T2 --only 1 --fresh)" "Fresh agent \(--f
 has "a weaker model is not resumed" "$(P fix-brief T3 --only 1)" "Fresh agent \(built on sonnet, fixes need opus\)"
 touch -t 202001010000 "$sess/agent-ag2.jsonl"; has "cold: a fresh agent" "$(P fix-brief T2 --only 1)" "Fresh agent \(the implementer has been idle"
 touch "$sess/agent-ag2.jsonl"; printf '{"type":"assistant","message":{"id":"o1","model":"claude-opus-5-5","usage":{"input_tokens":0,"cache_read_input_tokens":50000,"output_tokens":0}}}\n' > "$(dirname "$(dirname "$sess")")/s1.jsonl"
-out=$(P cost T2); has "cost counts compactions and the context they cut" "$out" "T2 +implementer +opus-5-5 +- +1 +200k +1k +1 +\\\$0.56"
+out=$(P cost T2); has "cost counts compactions and the context they cut" "$out" "T2 +implementer +opus-5-5 +- +1 +0\.0 +200k +1k +1 +\\\$0.56"
 has "cost says what compacting cost" "$out" "compactions: 1, at least \\\$0.04"; has "cost prices the orchestrator session" "$out" "orchestrator session s1: \\\$0.01, 1 calls"
 has "brief asks for one Read call" "$(P brief T5 --write)" "with one Read call"
+has "cost has the actions column" "$(P cost T2)" "PER CALL"
+python3 - "$sess/agent-ag2.jsonl" <<'EOF'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    for i in range(50):
+        for k in range(1 if i else 2):
+            f.write(json.dumps({"type": "assistant", "message": {"id": "c%d" % i, "model": "claude-opus-5-5", "usage": {"output_tokens": 1},
+                    "content": [{"type": "tool_use", "id": "t%d-%d" % (i, k), "name": "Bash", "input": {}}]}}) + "\n")
+EOF
+out=$(P cost T2); has "actions per call are counted" "$out" "T2 +implementer +opus-5-5 +- +50 +1\.0 "; has "one action at a time is named" "$out" "one action at a time .*T2 implementer \(50 calls\)"
+
+echo "checklist, lessons, doctor timeout"
+hasnt "no checklist and no lessons: no self-check" "$(P brief T5)" "Self-check"
+edit 's/"review": \{"lines": 0\}/"review": {"lines": 0}}, "review": {"checklist": ["every list is scoped"]/' .claude/phase.json
+out=$(P brief T5); has "the implementer gets the reviewer's checklist" "$out" "Self-check, before the gate"; has "with its points" "$out" "^- every list is scoped"
+has "lessons start empty" "$(P lessons)" "no lessons"
+printf 'VERDICT: CHANGES\n1. `a.ts:1` - major\n   wrong\n   Lesson: A filter must not reveal what the row hides.\n2. `b.ts:1` - minor\n   - **Lesson:** Show a button only if the API would allow it {x}.\n' > .worktrees/.phase/t2.review/findings-1.md
+out=$(P approve T2); has "approve collects the lessons" "$out" "A filter must not reveal what the row hides"
+hasnt "the same lesson is kept once" "$(P approve T2)" "A filter must not"
+has "lesson repeated by hand is not added" "$(P lesson T3 'a filter must not reveal what the row hides')" "already recorded"
+has "lesson by hand" "$(P lesson T3 'Test the empty list')" "recorded"
+out=$(P lessons); has "lessons are numbered with their task" "$out" "1 T2: A filter must not"; has "third lesson" "$out" "3 T3: Test the empty list"
+out=$(P brief T5); has "implementer brief carries lessons" "$out" "lesson from an earlier review: A filter must not reveal what the row hides. \(T2\)"; has "braces in a lesson are kept" "$out" "would allow it \{x\}"
+has "review brief carries lessons" "$(P review-brief T5)" "Mistakes earlier reviews found"
+edit 's/"checklist": \["every/"lessons": 1, "checklist": ["every/' .claude/phase.json
+out=$(P brief T5); has "the newest lessons win" "$out" "Test the empty list"; hasnt "older ones stay out" "$out" "A filter must not"; has "and are marked" "$(P lessons)" "1 \(too old for briefs\) T2"
+P lessons --drop 1 3 >/dev/null; out=$(P lessons); has "drop removes" "$out" "1 T2: Show a button"; hasnt "dropped lesson is gone" "$out" "A filter must not"
+edit 's/"remote": null/"doctor": {"timeout": 1, "checks": [{"name": "stuck service", "run": "sleep 30"}]}, "remote": null/' .claude/phase.json
+t0=$(date +%s); out=$(P doctor); has "a stuck check is a FAIL that says so" "$out" "FAIL +check stuck service: .*timed out after 1s"
+[ $(( $(date +%s) - t0 )) -lt 10 ] && ok "doctor does not hang" || bad "doctor hung"
 unset CLAUDE_CONFIG_DIR
 
 echo

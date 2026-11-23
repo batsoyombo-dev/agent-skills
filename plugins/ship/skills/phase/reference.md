@@ -89,7 +89,9 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `brief.exports` | `{regex, max}`: for each existing file the spec names in backticks, its length and the lines matching `regex` (exported signatures), up to `max` characters (default 8000). Empty regex = off. TypeScript: `^export (default )?(async )?(abstract )?(function\|class\|const\|type\|interface\|enum)\b` |
 | `brief.dep_reports` | characters of the direct dependencies' reports (Interfaces, Spec differences, Built) copied into the brief (default 6000; 0 = off) |
 | `brief.inline_max` | character budget for `brief.inline` (default 40000); sections past it are listed for the implementer to read |
-| `review.checklist` | project invariants the reviewer checks one by one |
+| `review.checklist` | project invariants the reviewer checks one by one; the implementer's brief carries them as its self-check before the gate |
+| `review.lessons` | how many of the newest lessons briefs carry (default 15; 0 for none). Lessons come from the `Lesson:` lines of review findings (`approve` collects them) and `phase.py lesson`; `lessons --drop <n>` removes one. They live in `.phase/lessons.md`, not in git |
+| `doctor.timeout` | seconds before one `doctor` check is killed and reported as a FAIL (default 20), so a stuck service stops the run instead of hanging it |
 | `doctor.require` | tools that must exist (placeholders allowed) |
 | `doctor.checks` | `[{name, run}]` commands that must exit 0 (database reachable, infra up). `doctor` also warns when a gate, test or commit command agents run would prompt for approval (it reads the user and project `.claude/settings*.json` allow, ask and deny rules) and prints the rules to add |
 
@@ -125,7 +127,7 @@ Briefs, notes, review packages (`<id>.brief.md`, `<id>.notes.md`, `<id>.review/`
 
 ## Cost
 
-`phase.py cost [ID ...] [--days N]` reads Claude Code's transcripts of this project (`$CLAUDE_CONFIG_DIR` or `~/.claude`) and prints, per agent, the model, effort, calls, largest context, output tokens, compactions and the price at API rates (`PRICES` in phase.py; `-` for a model not listed). It finds agents by their description, which must start with `<ID>:`. A compaction is a call without usage in the transcript, so its price is a floor: a cached read of the context plus the summary. With cache reads at a twentieth of the input price, compacting a run of a few dozen calls costs more than it saves, so the agents' `autoCompactWindow` is a safety net, not a saving. The last lines price each orchestrator session as a whole. Compare a new tier or a config change with it before rolling it out: look at price per landed task, fix agents included, next to the review findings.
+`phase.py cost [ID ...] [--days N]` reads Claude Code's transcripts of this project (`$CLAUDE_CONFIG_DIR` or `~/.claude`) and prints, per agent, the model, effort, calls, actions per call, largest context, output tokens, compactions and the price at API rates (`PRICES` in phase.py; `-` for a model not listed). It finds agents by their description, which must start with `<ID>:`. A compaction is a call without usage in the transcript, so its price is a floor: a cached read of the context plus the summary. With cache reads at a twentieth of the input price, compacting a run of a few dozen calls costs more than it saves, so the agents' `autoCompactWindow` is a safety net, not a saving. The last lines price each orchestrator session as a whole. Compare a new tier or a config change with it before rolling it out: look at price per landed task, fix agents included, next to the review findings.
 
 ## Timing
 

@@ -111,8 +111,8 @@ DEFAULTS = {
     "smoke": None,
     "brief": {"spec": "{spec}", "done_when": "{done_when}", "read": [], "rules": [], "extra": [],
               "inline": [], "inline_max": 40000, "exports": {"regex": "", "max": 8000}, "dep_reports": 6000},
-    "review": {"checklist": []},
-    "doctor": {"require": [], "checks": []},
+    "review": {"checklist": [], "lessons": 15},
+    "doctor": {"require": [], "checks": [], "timeout": 20},
     "repos": {},
 }
 
@@ -1077,7 +1077,7 @@ def cmd_doctor(proj, args):
             continue
         ok("repo %s: %s" % (name, root))
         if proj.remote:
-            if git_ok(root, "ls-remote", "-q", "--exit-code", proj.remote, "refs/heads/" + proj.base):
+            if git_ok(root, "ls-remote", "-q", "--exit-code", proj.remote, "refs/heads/" + proj.base, timeout=FETCH_TIMEOUT):
                 ok("  %s reachable" % proj.base_ref())
             else:
                 no("  cannot reach %s in %s" % (proj.base_ref(), root))
@@ -1102,10 +1102,11 @@ def cmd_doctor(proj, args):
     for chk in proj.cfg["doctor"]["checks"]:
         cmd = proj.fmt(chk["run"] if isinstance(chk, dict) else chk, proj.ctx("doctor"))
         label = chk.get("name", cmd) if isinstance(chk, dict) else cmd
-        p = run(cmd, cwd=proj.main, shell=True, check=False)
+        # A stuck service (a hung Docker daemon) must be a FAIL that names it, not a run that never starts.
+        p = run(cmd, cwd=proj.main, shell=True, check=False, timeout=proj.cfg["doctor"]["timeout"])
         (ok if p.returncode == 0 else no)("check %s%s" % (label, "" if p.returncode == 0 else ": " + (p.stderr or p.stdout).strip()[-200:]))
     if any(proj.rcfg(r, "deploy") for r in proj.repos or [proj.primary]):
-        (ok if shutil.which("gh") and run(["gh", "auth", "status"], check=False).returncode == 0 else no)("gh authenticated (deploy-wait)")
+        (ok if shutil.which("gh") and run(["gh", "auth", "status"], check=False, timeout=proj.cfg["doctor"]["timeout"]).returncode == 0 else no)("gh authenticated (deploy-wait)")
     sm = proj.cfg.get("smoke") or {}
     ba = sm.get("basic_auth")
     if ba:
@@ -1506,6 +1507,11 @@ def cmd_brief(proj, args):
     lines += [proj.fmt(e, c) for e in b["extra"]]
     if b["rules"]:
         lines += ["", "Project rules:"] + ["- " + proj.fmt(r, c) for r in b["rules"]]
+    checklist, lessons = proj.rcfg(c["repo"], "review")["checklist"], lesson_lines(proj)
+    if checklist or lessons:
+        lines += ["", "Self-check, before the gate. The reviewer judges your branch by these points, so go through your own diff "
+                  "with each one and fix what it finds; skip the ones that can't apply:"]
+        lines += ["- " + proj.fmt(x, c) for x in checklist] + ["- lesson from an earlier review: " + x for x in lessons]
     lines += [
         "",
         "Gate: %s check %s   (must end with RESULT: PASS before you report; run it with a 10-minute Bash timeout)" % (proj.script, task),
@@ -1651,6 +1657,9 @@ def cmd_review_brief(proj, args):
     lines.append("Why review is required: %s" % st.get("review", "requested"))
     if checklist or b["rules"]:
         lines += ["", "Project invariants to check:"] + ["- " + proj.fmt(x, c) for x in checklist + b["rules"]]
+    lessons = lesson_lines(proj)
+    if lessons:
+        lines += ["", "Mistakes earlier reviews found; check that this branch does not repeat them:"] + ["- " + x for x in lessons]
     lines.append("Implementer's report (read it last): %s/%s" % (c["wt"], REPORT))
     if not (args.write or args.recheck):
         print("\n".join(lines))
@@ -1762,6 +1771,75 @@ def cmd_fix_brief(proj, args):
     ]))
 
 
+LESSON = re.compile(r"^[\s>*_-]*lesson[*_]*\s*:[*_]*\s*(.+)$", re.I)
+
+
+def lessons_path(proj):
+    os.makedirs(proj.state_dir, exist_ok=True)
+    return os.path.join(proj.state_dir, "lessons.md")
+
+
+def read_lessons(proj):
+    """[(task, text)], oldest first. One `- <task>: <text>` line each."""
+    path = lessons_path(proj)
+    lines = open(path, encoding="utf-8").read().splitlines() if os.path.isfile(path) else []
+    return [tuple(x.strip() for x in l[2:].split(": ", 1)) for l in lines if l.startswith("- ") and ": " in l]
+
+
+def write_lessons(proj, lessons):
+    with open(lessons_path(proj), "w", encoding="utf-8") as f:
+        f.write("".join("- %s: %s\n" % x for x in lessons))
+
+
+def add_lessons(proj, task, texts):
+    """Add the lessons not recorded yet; returns the added ones."""
+    key = lambda t: re.sub(r"\W+", " ", t).strip().lower()  # noqa: E731
+    with proj.lock():
+        lessons = read_lessons(proj)
+        seen, added = {key(t) for _, t in lessons}, []
+        for text in (re.sub(r"\s+", " ", t).strip()[:300] for t in texts):
+            if key(text) and key(text) not in seen:
+                seen.add(key(text))
+                added.append(text)
+        if added:
+            write_lessons(proj, lessons + [(task, t) for t in added])
+    return added
+
+
+def lesson_lines(proj):
+    """The newest review.lessons lessons, for briefs."""
+    n = proj.cfg["review"]["lessons"]
+    return ["%s (%s)" % (text, task) for task, text in read_lessons(proj)[-n:]] if n else []
+
+
+def findings_lessons(proj, task):
+    """The `Lesson:` lines of a task's review findings."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(artifact(proj, task, "review"), "findings-*.md"))):
+        out += [m.group(1) for m in map(LESSON.match, open(path, encoding="utf-8", errors="replace")) if m]
+    return out
+
+
+def cmd_lesson(proj, args):
+    if add_lessons(proj, args.task, [args.text]):
+        print("recorded; every later brief carries it (`%s lessons` lists them)" % proj.script)
+    else:
+        print("already recorded")
+
+
+def cmd_lessons(proj, args):
+    if args.drop:
+        with proj.lock():
+            lessons = read_lessons(proj)
+            for n in args.drop:
+                if not 1 <= n <= len(lessons):
+                    die("no lesson %d" % n)
+            write_lessons(proj, [x for i, x in enumerate(lessons, 1) if i not in args.drop])
+    lessons, n = read_lessons(proj), proj.cfg["review"]["lessons"]
+    print("\n".join("%3d %s%s: %s" % (i, "" if i > len(lessons) - n else "(too old for briefs) ", t, x)
+                    for i, (t, x) in enumerate(lessons, 1)) or "no lessons")
+
+
 def minors_path(proj):
     os.makedirs(proj.state_dir, exist_ok=True)
     return os.path.join(proj.state_dir, "minors.md")
@@ -1797,7 +1875,7 @@ def transcript_cost(path):
     """Calls, largest context, output tokens, price, models and effort of one Claude Code transcript, and its compactions.
     A compaction is a call of its own that the transcript has no usage for: priced here as a cached read of the context
     plus the summary it wrote, so it is a floor."""
-    seen, effort, pre, summary, last = {}, "", [], 0, ""
+    seen, effort, pre, summary, last, actions = {}, "", [], 0, "", set()
     for line in open(path, encoding="utf-8", errors="replace"):
         if not any(k in line for k in ('"usage"', '"effort"', '"compact_boundary"', '"isCompactSummary"')):
             continue
@@ -1815,6 +1893,8 @@ def transcript_cost(path):
             summary += len(body if isinstance(body, str) else "".join(b.get("text") or "" for b in body or []))
         if o.get("type") == "assistant" and isinstance(m, dict) and m.get("id"):
             seen[m["id"]] = (m.get("model") or "", m.get("usage") or {})
+            body = m.get("content")
+            actions |= {b.get("id") for b in (body if isinstance(body, list) else []) if b.get("type") == "tool_use"}
             last = last if (m.get("model") or "<").startswith("<") else m["model"]
     n = lambda u, k: u.get(k) or 0  # noqa: E731
     ctx, out = max(pre or [0]), 0
@@ -1838,7 +1918,7 @@ def transcript_cost(path):
     price = PRICES.get(last, (0, 0, 0))
     extra = (price[2] * sum(pre) + price[1] * summary / 4) / 1e6 if pre else 0.0
     return {"calls": len(seen), "ctx": ctx, "out": out, "usd": usd + extra if priced else None, "models": models,
-            "effort": effort, "compactions": len(pre), "compact_usd": extra}
+            "effort": effort, "actions": len(actions), "compactions": len(pre), "compact_usd": extra}
 
 
 def cmd_cost(proj, args):
@@ -1846,7 +1926,7 @@ def cmd_cost(proj, args):
     root = transcripts_root(proj)
     want = [norm_id(t) for t in args.task]
     known = {norm_id(st["task"]): st for st in proj.states() if st.get("task")}
-    rows, totals, sessions, compact = [], {}, {}, [0, 0.0]
+    rows, totals, sessions, compact, slow = [], {}, {}, [0, 0.0], []
     for meta in sorted(glob.glob(os.path.join(root, "*", "subagents", "agent-*.meta.json")), key=os.path.getmtime):
         try:
             d = json.load(open(meta, encoding="utf-8"))
@@ -1866,20 +1946,25 @@ def cmd_cost(proj, args):
         t = transcript_cost(path)
         role = re.sub(r"^(ship:)?phase-", "", d.get("agentType") or "?")
         rows.append([known[tid]["task"], role, ",".join(sorted(x.replace("claude-", "") for x in t["models"])) or "-",
-                     t["effort"] or "-", t["calls"], "%dk" % (t["ctx"] // 1000), "%dk" % (t["out"] // 1000),
+                     t["effort"] or "-", t["calls"], "%.1f" % (t["actions"] / t["calls"]) if t["calls"] else "-", "%dk" % (t["ctx"] // 1000), "%dk" % (t["out"] // 1000),
                      str(t["compactions"] or "-"), "$%.2f" % t["usd"] if t["usd"] is not None else "-"])
         totals.setdefault(known[tid]["task"], []).append(t["usd"] or 0)
+        if t["calls"] >= 40 and t["actions"] < 1.5 * t["calls"]:
+            slow.append("%s %s (%d calls)" % (known[tid]["task"], role, t["calls"]))
         compact[0] += t["compactions"]
         compact[1] += t["compact_usd"]
         sessions[os.path.basename(os.path.dirname(os.path.dirname(meta)))] = 1
     if not rows:
         print("no agent transcripts found under %s" % root)
         return 0
-    print_table(["TASK", "ROLE", "MODEL", "EFFORT", "CALLS", "MAX CTX", "OUTPUT", "COMPACTED", "API PRICE"], rows)
+    print_table(["TASK", "ROLE", "MODEL", "EFFORT", "CALLS", "PER CALL", "MAX CTX", "OUTPUT", "COMPACTED", "API PRICE"], rows)
     print("\nper task: " + ", ".join("%s $%.2f" % (k, sum(v)) for k, v in totals.items()))
     print("total: $%.2f for %d task(s), $%.2f each (API prices; a subscription counts usage its own way; the "
           "orchestrator's own turns are not included)"
           % (sum(map(sum, totals.values())), len(totals), sum(map(sum, totals.values())) / len(totals)))
+    if slow:
+        print("one action at a time (PER CALL under 1.5): %s. Every call sends the whole conversation again; batch reads and "
+              "edits" % ", ".join(slow))
     if compact[0]:
         print("compactions: %d, at least $%.2f of the total, and each makes the agent re-read; a task that compacts is too "
               "big, or the agents' autoCompactWindow is too small" % (compact[0], compact[1]))
@@ -2492,6 +2577,10 @@ def cmd_approve(proj, args):
     proj.save(task, approved=tip, approved_note=args.note or "")
     proj.event(task, "approved")
     print("review approval recorded for %s @ %s%s" % (task, tip[:7], (": " + args.note) if args.note else ""))
+    added = add_lessons(proj, task, findings_lessons(proj, task))
+    if added:
+        print("lessons for later briefs (drop one that is wrong or too narrow: %s lessons --drop <n>):" % proj.script)
+        print("\n".join("  %s" % t for t in added))
 
 
 def gh_json(args):
@@ -2656,6 +2745,8 @@ Plan
   fix-brief <ID> [--only N,M] who fixes the reviewer's findings (default: blockers and majors) and the message: the
                               implementer while its cache is warm, else a fresh agent (--fresh forces one)
   minor <ID> "<text>"         keep a minor finding for a later batch; `minors [--all] [--close N ...]` lists and closes
+  lesson <ID> "<rule>"        keep a general rule a mistake taught, for every later brief (approve collects the reviewer's);
+                              `lessons [--drop N ...]` lists and removes
 Work
   add <ID> [--repo NAME]      worktree + branch phase/<id> from the base, env, slot/port, setup hooks; resumes.
       [--force]               refuses past agents.max, a repo's max_agents, a phase cap or a serial task
@@ -2707,7 +2798,7 @@ def main(argv):
         sub.add_argument("action", nargs="?", default="show", choices=["show", "release"])
         sub.add_argument("--force", action="store_true")
     if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove", "approve", "mark",
-               "tier", "fix-brief", "minor"):
+               "tier", "fix-brief", "minor", "lesson"):
         sub.add_argument("task")
     if cmd == "ready":
         sub.add_argument("scope", nargs="*")
@@ -2722,8 +2813,10 @@ def main(argv):
     if cmd == "fix-brief":
         sub.add_argument("--only")
         sub.add_argument("--fresh", action="store_true")
-    if cmd == "minor":
+    if cmd in ("minor", "lesson"):
         sub.add_argument("text")
+    if cmd == "lessons":
+        sub.add_argument("--drop", nargs="+", type=int)
     if cmd == "minors":
         sub.add_argument("--all", action="store_true")
         sub.add_argument("--close", nargs="+", type=int)
@@ -2770,6 +2863,7 @@ def main(argv):
         "check": cmd_check, "merge": cmd_merge, "land": cmd_land, "abort": cmd_abort, "approve": cmd_approve,
         "mark": cmd_mark, "lease": cmd_lease, "stats": cmd_stats, "cost": cmd_cost, "tier": cmd_tier,
         "fix-brief": cmd_fix_brief, "minor": cmd_minor, "minors": cmd_minors,
+        "lesson": cmd_lesson, "lessons": cmd_lessons,
         "deploy-wait": cmd_deploy_wait, "smoke": cmd_smoke, "remove": cmd_remove,
     }
     if cmd not in table:
