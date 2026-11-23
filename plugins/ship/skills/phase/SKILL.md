@@ -60,36 +60,52 @@ If `.claude/phase.json` is missing, `$P` says so. Make one:
   - With fewer slots than ready tasks, start the highest `unblocks` first: they hold up the most later work.
   - A `serial` task runs with no other task active in the same repo.
   - `$P add` enforces these and refuses with the reason. Pass `--force` only when the user agreed.
+  - Use the tier of each task (see "Tiers" below); `ready` shows it.
   - Don't run two tasks together whose specs rework the same feature (same module, service or table); start the second after the first lands. Shared wiring files (route lists, registries, indexes) are fine: they merge, and the checks catch the rest.
 - Tell the user in 2–3 lines what you start, what you skip and why, then go. Wait for a yes only when a task needs something from them.
 
 ## 2. Start implementers
 
-For each task, one Bash call each:
+For each task, one Bash call each, never chained behind a `land` or another task's `add` (if one command hangs, only that one is lost):
 
 ```bash
-$P add <ID>        # worktree, branch phase/<id>, env, slot and port, setup hooks
-$P brief <ID>      # the implementer prompt
+$P add <ID>             # worktree, branch phase/<id>, env, slot and port, setup hooks
+$P brief <ID> --write   # writes the brief to a file; prints the Agent parameters and a short prompt
 ```
 
-Replace the brief's `Context from other tasks: none` with anything decided this session that the spec doesn't say: an interface another task depends on, a user decision, a file another running task is reworking.
+The brief stays in its file, so it costs your own context nothing: don't print or read it. In the printed prompt, replace `Context from other tasks: none` with anything decided this session that the spec doesn't say: an interface another task depends on, a user decision, a file another running task is reworking. Keep it to a few lines; don't repeat the brief or the session's history.
 
-Send all Agent calls **in one message**: `subagent_type` the implementer type (`phase-implementer` or `ship:phase-implementer`), the brief as the prompt, description `<ID>: <short task>`. If that agent type isn't listed, use `general-purpose` with `$P brief <ID> --inline-rules`. Then record each agent id: `$P note <ID> agent=<id>`.
+Send all Agent calls **in one message**: `subagent_type` the implementer type (`phase-implementer` or `ship:phase-implementer`), the printed prompt, description `<ID>: <short task>` (the ID must come first: `$P cost` finds agents by it), and **the `model` and `effort` that `brief --write` printed**. Set both exactly as printed, and leave out the ones it doesn't print: this skill asks for them. If that agent type isn't listed, use `general-purpose` with `$P brief <ID> --inline-rules`. Then record each agent id: `$P note <ID> agent=<id>`.
 
 The agents run in the background and you are notified as each finishes. Don't poll. Meanwhile, review and land whatever is done.
+
+### Tiers
+
+`agents.tiers` in phase.json names model and effort pairs; the plan's `Tier` column (or `agents.tier_of`) gives each task one. `$P tier <ID>` shows what a task and its reviewer get. With no tiers configured, agents inherit the session's model and effort, and nothing is printed to set.
+
+Escalate when the cheaper attempt is not enough, instead of retrying at the same level:
+
+- the implementer reports BLOCKED, or hands back twice without `RESULT: PASS`: `$P tier <ID> --escalate`, then a **fresh** implementer with the new parameters and the `$P brief <ID> --write` prompt plus "Continue: the branch has N commits; read the notes file and the report first."
+- the reviewer finds a blocker or major: `$P fix-brief <ID>` already prints the escalated tier.
+
+Never change a running agent's model or effort; that throws its cache away.
 
 ## 3. Each finished task: gate, then review
 
 1. `$P note <ID> status=review`, then `$P check <ID> --quick`. It takes seconds: every static check, plus whether review is required.
    - FAIL: send the lines back to the same agent (SendMessage), or fix small things in the worktree yourself, commit, and check again.
-2. If it printed `review required (...)`, start a `phase-reviewer` agent in the background now, with `$P review-brief <ID>` as its prompt. Don't add your own conclusions.
+2. If it printed `review required (...)`, start a `phase-reviewer` agent in the background now, description `<ID>: review`, with the prompt and Agent parameters that `$P review-brief <ID> --write` prints. It has the diff and the spec as files, so the reviewer starts judging at once. Don't add your own conclusions, and never tell it what not to flag.
 3. While it reviews, **run the full gate yourself**: `$P check <ID>`. Don't trust the report. Test commands that already passed on this exact commit are not re-run (the record is phase.py's own, and merge runs the full suite again); everything else is checked again. A fix commit needs the gate again, and a new approval.
 4. Read the work:
-   - With a reviewer: read the report and the verdict, not the whole diff. The reviewer reads it line by line in its own context; reading it twice only fills yours.
+   - With a reviewer: read the report and the verdict, not the whole diff and not the findings file. The reviewer reads it line by line in its own context; reading it twice only fills yours.
    - Without one: read the diff against the spec and the report (the diff command is in `$P review-brief <ID>`), and check each done-when point.
 5. Reviewer verdicts:
-   - On `VERDICT: CHANGES`: blockers and majors go back to the implementer, or you fix them; then gate again. Send a blocker fix to the reviewer again.
-   - Minors you may record and skip.
+   - **Blockers and majors** are fixed before merge, in one round with all of them:
+     - the implementer finished less than 4 minutes ago: SendMessage it the finding numbers and the findings path (its cache is still warm).
+     - otherwise a **fresh** implementer, description `<ID>: fix`, with the prompt and parameters from `$P fix-brief <ID> [--only 1,3]`. Waking an agent with a long, cold context costs more than starting one that reads only what the findings name.
+     - Then gate again. After a blocker, `$P review-brief <ID> --recheck` gives a reviewer only the fix commits.
+   - **Minors never start a round.** `$P minor <ID> "<file:line: what goes wrong → fix>"` for each, and merge. If you think a minor is really about visibility, rights, lost data or two users at once, treat it as major.
+   - A finding you judge wrong: say why in the approve note.
    - Then record it: `$P approve <ID> --note "<reviewer APPROVE, or which findings you verified fixed>"`. Merge refuses a required review without an approval for the current tip, so a new commit needs a new approval.
 
 6. No browser, device or visual checks during the run, by you or by any agent: they stall the queue. Collect the screens each task changed (from the reports' "Needs the user") into the final summary, for the user to look at.
@@ -122,9 +138,11 @@ Co-Authored-By: <the attribution trailer from the system prompt>"
 - `$P deploy-wait <sha>` with `run_in_background: true`, when deploy is configured. Keep merging meanwhile; it follows the run containing your commit even when a newer push cancels a pending one.
 - After the deploy: `$P smoke <ID>` runs the report's Smoke lines.
   - Deploy or smoke failure: stop the queue and fix forward with a new commit. Never force-push.
-- `$P remove <ID>`: teardown hooks, worktree, branch. The report is kept in `.phase/`.
+- `$P remove <ID>`: teardown hooks, worktree, branch. The report is kept in `.phase/`, and later tasks get its Interfaces in their brief.
+- Run `land`, `remove` and each `add` as **separate** Bash calls. phase.py kills a fetch, push, hook or test that hangs and says which one; a chain of five commands hides it.
 - `$P overlap`: for every running task that shares files with what just landed, SendMessage its agent: "the base moved (<task> landed, touching <files>); at your next commit run the sync command and check again."
 - **Rolling start:** run `$P ready <scope>` again and start any task in scope that became ready (section 2). Stop when nothing in scope is running, ready or queued.
+- **Minors:** when nothing else is ready, or `$P minors` lists about 15, fix them in one batch: `$P add M<n>` (an ad-hoc task), one implementer with the list, gate, merge with a done-log line, then `$P minors --close <numbers>`.
 - **Wave boundary:** when nothing is running, in review or queued but later tasks remain, and this conversation has grown long, tell the user to `/clear` and run `/phase <scope>` again. The next wave starts with a fresh context, and nothing is lost because state lives in `.phase/`.
 
 ## 5. Report
@@ -133,6 +151,8 @@ Finish with a short summary:
 
 - tasks landed (commit shas)
 - where the time went: the slowest step per task from `$P stats`, when one stands out
+- what it cost: the per-task line of `$P cost <IDs>`, and any task that cost much more than the others or needed escalation (its tier, or its size, is wrong in the plan)
+- open minors (`$P minors`)
 - deploy and smoke results
 - decisions made
 - screens the tasks changed, for the user to look at (nothing was checked in a browser)

@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import urllib.request
 
 SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORT = ".phase-report.md"
+FETCH_TIMEOUT, PUSH_TIMEOUT = 60, 300  # seconds; a network command that hangs must not hold the queue
 INTEGRATION = "_integration"
 ACTIVE = ("running", "review", "merging", "landing")
 
@@ -34,7 +36,7 @@ DEFAULTS = {
     "base": "staging",
     "remote": "origin",
     "vars": {},
-    "agents": {"max": 5},
+    "agents": {"max": 5, "tiers": {}, "default_tier": "", "review_tier": "", "escalate_tier": "", "tier_of": {}},
     "plan": {
         "file": "",
         "columns": {
@@ -46,6 +48,7 @@ DEFAULTS = {
             "spec": ["spec"],
             "done_when": ["done when", "acceptance"],
             "parallel": ["parallel"],
+            "tier": ["tier"],
         },
         "done": r"^done\b",
         "agent_owners": ["agent", ""],
@@ -69,9 +72,11 @@ DEFAULTS = {
         "setup": [],
         "refresh": [],
         "teardown": [],
+        "hook_timeout": 600,
     },
     "gate": {
         "tests": [],
+        "test_timeout": 1800,
         "conditional": [],
         "per_file": [],
         "forbid": [
@@ -90,7 +95,8 @@ DEFAULTS = {
             r"\bmarkTest(Skipped|Incomplete)\(|->skip\(|@skip\b|\b(it|describe|test)\.(skip|only)\(|\bx(it|describe)\("
             r"|\bfdescribe\(|@pytest\.mark\.(skip|xfail)|\bt\.Skip(Now)?\(|\bskip:\s*(true|['\"])"
         ),
-        "review": {"lines": 400, "triggers": []},
+        "review": {"lines": 400, "triggers": [],
+                   "skip_diff": ["*.lock", "*.lockb", "*lock.json", "*lock.yaml", "*.gen.*", "*.snap", "*.min.*"]},
     },
     "land": {
         "progress_file": "",
@@ -101,7 +107,7 @@ DEFAULTS = {
     "deploy": None,
     "smoke": None,
     "brief": {"spec": "{spec}", "done_when": "{done_when}", "read": [], "rules": [], "extra": [],
-              "inline": [], "inline_max": 40000},
+              "inline": [], "inline_max": 40000, "exports": {"regex": "", "max": 8000}, "dep_reports": 6000},
     "review": {"checklist": []},
     "doctor": {"require": [], "checks": []},
     "repos": {},
@@ -135,12 +141,49 @@ def now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-def run(cmd, cwd=None, check=True, env=None, shell=False):
-    """Run a command, return CompletedProcess with text stdout/stderr."""
-    p = subprocess.run(
-        cmd, cwd=cwd, shell=shell, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        executable="/bin/bash" if shell else None,
-    )
+def kill_group(p):
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def wait_group(p, timeout):
+    """Wait for p, started in its own session. Returns (output, timed out). Past the timeout, or when this process
+    is told to stop, the whole process group is killed (a shell's children too), so nothing is left running."""
+    try:
+        return p.communicate(timeout=timeout or None), False
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        try:
+            return p.communicate(timeout=5), True
+        except subprocess.TimeoutExpired:  # a grandchild that left the group still holds the pipe
+            return ("", ""), True
+    except BaseException:
+        kill_group(p)
+        raise
+
+
+def run(cmd, cwd=None, check=True, env=None, shell=False, timeout=None):
+    """Run a command, return CompletedProcess with text stdout/stderr. Past `timeout` seconds it is killed (exit 124)."""
+    if timeout:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, shell=shell, env=env, text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, executable="/bin/bash" if shell else None, start_new_session=True,
+        )
+        (out, err), late = wait_group(proc, timeout)
+        p = subprocess.CompletedProcess(cmd, 124 if late else proc.returncode, out or "",
+                                        (err or "") + ("\ntimed out after %ds" % timeout if late else ""))
+    else:
+        p = subprocess.run(
+            cmd, cwd=cwd, shell=shell, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            executable="/bin/bash" if shell else None,
+        )
     if check and p.returncode != 0:
         shown = cmd if isinstance(cmd, str) else " ".join(shlex.quote(c) for c in cmd)
         die("command failed (%d): %s\n%s" % (p.returncode, shown, (p.stderr or p.stdout).strip()[-2000:]))
@@ -151,8 +194,8 @@ def git(repo, *args, check=True):
     return run(["git", "-C", repo] + list(args), check=check).stdout.strip()
 
 
-def git_ok(repo, *args):
-    return run(["git", "-C", repo] + list(args), check=False).returncode == 0
+def git_ok(repo, *args, timeout=None):
+    return run(["git", "-C", repo] + list(args), check=False, timeout=timeout).returncode == 0
 
 
 def norm_id(task):
@@ -349,9 +392,11 @@ class Project:
         if not self.remote:
             return
         p = run(["git", "-C", root, "fetch", "-q", self.remote,
-                 "+refs/heads/%s:refs/remotes/%s/%s" % (self.base, self.remote, self.base)], check=False)
+                 "+refs/heads/%s:refs/remotes/%s/%s" % (self.base, self.remote, self.base)], check=False,
+                env=dict(os.environ, GIT_TERMINAL_PROMPT="0"), timeout=FETCH_TIMEOUT)
         if p.returncode != 0:
-            info("fetch failed in %s; using the last known %s" % (root, self.base_ref()))
+            info("fetch %s in %s; using the last known %s"
+                 % ("timed out" if p.returncode == 124 else "failed", root, self.base_ref()))
 
     def plan_text(self):
         root = self.repo_root(self.primary)
@@ -685,6 +730,8 @@ def parse_blocks(text, pcfg, repos, primary, plan_file):
                 cur["parallel"] = val
             elif key == "owner":
                 cur["owner"] = val
+            elif key == "tier":
+                cur["tier"] = val
             elif key == "goal":
                 cur["goal"] = val
             elif key == "blocked by":
@@ -838,9 +885,12 @@ def hook_env(proj, c, action):
 
 
 def run_hooks(proj, c, cmds, action, cwd):
+    limit = proj.rcfg(c["repo"], "worktree")["hook_timeout"]
     for cmd in cmds:
-        shown = proj.fmt(cmd, c)
-        p = run(shown, cwd=cwd, shell=True, check=False, env=hook_env(proj, c, action))
+        shown, t0 = proj.fmt(cmd, c), time.time()
+        p = run(shown, cwd=cwd, shell=True, check=False, env=hook_env(proj, c, action), timeout=limit)
+        if time.time() - t0 > 30:
+            info("slow %s hook (%s): %s" % (action, dur(time.time() - t0), shown[:120]))
         if p.returncode != 0:
             die("%s hook failed in %s:\n  %s\n%s" % (action, cwd, shown, (p.stderr or p.stdout).strip()[-3000:]))
 
@@ -951,8 +1001,11 @@ def run_tests(proj, repo, wt, c, cmds, log):
             shown = proj.fmt(cmd, c)
             fh.write("$ %s\n" % shown)
             fh.flush()
-            p = subprocess.run(shown, cwd=wt, shell=True, executable="/bin/bash", stdout=fh, stderr=subprocess.STDOUT,
-                               env=hook_env(proj, c, "test"))
+            p = subprocess.Popen(shown, cwd=wt, shell=True, executable="/bin/bash", stdin=subprocess.DEVNULL, stdout=fh,
+                                 stderr=subprocess.STDOUT, env=hook_env(proj, c, "test"), start_new_session=True)
+            limit = proj.rcfg(repo, "gate")["test_timeout"]
+            if wait_group(p, limit)[1]:
+                return False, "`%s` timed out after %ds (gate.test_timeout); tail of %s:\n%s" % (shown, limit, log, tail(log, 25))
             if p.returncode != 0:
                 return False, "`%s` failed (exit %d); tail of %s:\n%s" % (shown, p.returncode, log, tail(log, 25))
     return True, "%d command(s) green (log: %s)" % (len(cmds), log)
@@ -1114,6 +1167,8 @@ def cmd_ready(proj, args):
             flags.append("assumes open " + ", ".join(t["blocked_by"]))
         if state == "ready" and unblocks.get(t["id"]):
             flags.append("unblocks %d" % unblocks[t["id"]])
+        if state == "ready" and proj.cfg["agents"]["tiers"]:
+            flags.append("tier " + tier_name(proj, t))
         title = re.sub(r"\s+", " ", t["task"])
         rows.append([t["id"], t["phase"]["id"], t["repo"], state, "; ".join([detail] + flags), title[:70]])
     print_table(["TASK", "PHASE", "REPO", "STATE", "DETAIL", "TITLE"], rows)
@@ -1239,7 +1294,44 @@ def add_worktree(proj, args, task, repo, row, serial):
     c = proj.ctx(task, repo)
     prepare_wt(proj, repo, wt, c, "add")
     print("worktree: %s (branch %s from %s @ %s)" % (wt, branch, proj.base_ref(), proj.state(task)["base"][:7]))
-    print("brief:    %s brief %s" % (proj.script, task))
+    print("brief:    %s brief %s --write" % (proj.script, task))
+
+
+# ---------------------------------------------------------------- tiers: which model and effort runs a task
+
+def tier_name(proj, row):
+    a = proj.cfg["agents"]
+    name = a["tier_of"].get(row["id"]) or (row.get("tier") or "").strip("`* —–-").lower() or a["default_tier"]
+    if name and name not in a["tiers"]:
+        die("unknown tier '%s' for %s (agents.tiers has: %s)" % (name, row["id"], ", ".join(a["tiers"]) or "none"))
+    return name or "inherit"
+
+
+def tier_params(proj, name):
+    """The Agent tool parameters of a tier, as text. Empty values are left out: the agent inherits them."""
+    if name and name != "inherit" and name not in proj.cfg["agents"]["tiers"]:
+        die("unknown tier '%s' (agents.tiers has: %s)" % (name, ", ".join(proj.cfg["agents"]["tiers"]) or "none"))
+    t = proj.cfg["agents"]["tiers"].get(name) or {}
+    out = ["%s: %s" % (k, t[k]) for k in ("model", "effort") if t.get(k) and t[k] != "inherit"]
+    return ", ".join(out) or "no model or effort parameter (inherits the session's)"
+
+
+def cmd_tier(proj, args):
+    st = proj.state(args.task)
+    row = find_task(proj, st.get("task") or args.task) or {"id": st.get("task") or args.task}
+    a, name = proj.cfg["agents"], st.get("tier")
+    if args.escalate:
+        if not a["escalate_tier"]:
+            die("agents.escalate_tier is not set")
+        tier_params(proj, a["escalate_tier"])
+        if not st:
+            die("unknown task %s (add it first)" % args.task)
+        proj.save(st["task"], tier=a["escalate_tier"])
+        proj.event(st["task"], "escalated", to=a["escalate_tier"])
+        name = a["escalate_tier"]
+    name = name or tier_name(proj, row)
+    print("build:  %s -> %s" % (name, tier_params(proj, name)))
+    print("review: %s -> %s" % (a["review_tier"] or "inherit", tier_params(proj, a["review_tier"])))
 
 
 def md_section(text, heading):
@@ -1272,12 +1364,21 @@ def inline_sections(proj, c, row):
             found.append(("%s, task block %s" % (proj.cfg["plan"]["file"], row["id"]), sec))
     for ent in b.get("inline") or []:
         m = re.search(r"[\w./*-]+\.\w+", proj.fmt(ent.get("file", ""), c).replace("`", ""))
-        if not m or not ent.get("heading"):
+        if not m or not (ent.get("heading") or ent.get("line")):
             continue
         files = sorted(glob.glob(os.path.join(c["wt"], m.group(0))))
         names = [""]
         if ent.get("names_from"):
-            names = list(dict.fromkeys(re.findall(ent["names_from"], "\n".join(t for _, t in found))))
+            seen = found[:1] if ent.get("names_in") == "first" else found
+            names = list(dict.fromkeys(re.findall(ent["names_from"], "\n".join(t for _, t in seen))))
+        if ent.get("line"):  # single lines (rows of a requirements or decisions table), one block per file
+            for f in files:
+                pats = [re.compile(proj.fmt(ent["line"], dict(c, name=re.escape(n)))) for n in names]
+                hits = [l for l in open(f, encoding="utf-8").read().splitlines() if any(x.search(l) for x in pats)]
+                if hits:
+                    found.append(("%s, the lines for %s" % (os.path.relpath(f, c["wt"]), ", ".join(names)[:200]),
+                                  "\n".join(re.sub(r" {2,}", " ", l) for l in hits)))
+            continue
         for name in names:
             heading = proj.fmt(ent["heading"], dict(c, name=name))
             for f in files:
@@ -1293,6 +1394,52 @@ def inline_sections(proj, c, row):
         else:
             skipped.append(label)
     return out, skipped
+
+
+def exports_map(proj, c, texts):
+    """Size and exported signatures of the existing files the spec names, so the implementer opens only what it needs."""
+    b = proj.rcfg(c["repo"], "brief")["exports"]
+    if not b.get("regex"):
+        return ""
+    rx, out, left = re.compile(b["regex"]), [], int(b.get("max") or 8000)
+    for rel in dict.fromkeys(re.findall(r"`([\w@.$()\[\]-]+(?:/[\w@.$()\[\]-]+)+\.\w+)`", "\n".join(texts))):
+        f = os.path.join(c["wt"], rel)
+        if not os.path.isfile(f):
+            continue
+        lines = open(f, encoding="utf-8", errors="replace").read().splitlines()
+        sig = ["  %d: %s" % (n, l.strip()[:160]) for n, l in enumerate(lines, 1) if rx.search(l)]
+        block = "\n".join(["%s (%d lines)" % (rel, len(lines))] + sig)
+        if len(block) > left:
+            block = "%s (%d lines, %d exports)" % (rel, len(lines), len(sig))
+            if len(block) > left:
+                break
+        out.append(block)
+        left -= len(block)
+    return "\n".join(out)
+
+
+def dep_reports(proj, c, row):
+    """What the tasks this one depends on built: the Interfaces, Built and Spec differences of their kept reports."""
+    left = int(proj.rcfg(c["repo"], "brief")["dep_reports"] or 0)
+    out = []
+    ids = [i for i in expand_deps(row.get("deps") or "")[0]
+           if os.path.isfile(os.path.join(proj.state_dir, norm_id(i) + ".report.md"))]
+    for i in ids:
+        text = open(os.path.join(proj.state_dir, norm_id(i) + ".report.md"), encoding="utf-8", errors="replace").read()
+        secs = [md_section(text, "## " + h) for h in ("Interfaces", "Spec differences", "Built")]
+        body, share = "\n".join(x for x in secs if x), left // len(ids)
+        if len(body) > share:
+            body = body[:share].rsplit("\n", 1)[0] + "\n(cut; the rest is in %s)" % os.path.join(
+                proj.state_dir, norm_id(i) + ".report.md")
+        if body and share > 200:
+            out.append("----- %s -----\n%s" % (i, body))
+    return "\n".join(out)
+
+
+def artifact(proj, task, name):
+    """A file of the run (brief, notes, review package) in the state directory: never in the worktree, never committed."""
+    os.makedirs(proj.state_dir, exist_ok=True)
+    return os.path.join(proj.state_dir, "%s.%s" % (norm_id(task), name))
 
 
 def cmd_brief(proj, args):
@@ -1332,9 +1479,17 @@ def cmd_brief(proj, args):
         "Gate: %s check %s   (must end with RESULT: PASS before you report)" % (proj.script, task),
         "Sync: %s sync %s    (when the gate says you are behind, or the orchestrator says staging moved)" % (proj.script, task),
         "Report: %s/%s" % (c["wt"], REPORT),
-        "Context from other tasks: none",
+        "Notes: %s   (your working notes; they survive compaction, and a later agent starts from them)"
+        % artifact(proj, task, "notes.md"),
     ]
+    if not args.write:
+        lines.append("Context from other tasks: none")
     sections, skipped = inline_sections(proj, c, row)
+    deps, exports = dep_reports(proj, c, row), exports_map(proj, c, [t for _, t in sections])
+    if deps:
+        lines += ["", "===== What the tasks you depend on built (from their reports; the code is the authority) =====", deps]
+    if exports:
+        lines += ["", "===== Existing files the spec names, with their exports (line: signature) =====", exports]
     if sections:
         lines += ["", "Spec text, copied from the worktree at the cut point. It is complete: don't search for or "
                   "re-read these sections; read only the other documents listed above."]
@@ -1342,6 +1497,17 @@ def cmd_brief(proj, args):
             lines += ["", "===== %s =====" % label, text]
     if skipped:
         lines += ["", "Not copied (over brief.inline_max), read them yourself: " + "; ".join(skipped)]
+    if args.write:
+        path = artifact(proj, task, "brief.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        name = st.get("tier") or tier_name(proj, row if row["id"] == task and "phase" in row else {"id": task})
+        print("Agent parameters: %s (tier %s)" % (tier_params(proj, name), name))
+        print("Prompt:")
+        print("You are the implementer for task %s (%s). Your complete brief is %s (%d KB): read the whole file first, in as "
+              "few Read calls as possible, and follow it exactly.\nContext from other tasks: none"
+              % (task, row["task"], path, os.path.getsize(path) // 1024))
+        return 0
     print("\n".join(lines))
     if args.inline_rules:
         candidates = [os.path.join(SKILL_DIR, "agents", "phase-implementer.md"),
@@ -1351,6 +1517,85 @@ def cmd_brief(proj, args):
             die("phase-implementer.md not found next to the skill (looked in %s)" % ", ".join(candidates))
         body = open(found[0]).read()
         print("\nStanding rules:\n" + re.sub(r"(?s)^---.*?---\s*", "", body))
+
+
+DIFF_PART_LINES, DIFF_PART_CHARS = 1500, 60000  # one Read call each
+
+
+def diff_parts(proj, repo, wt, base, paths):
+    """The diff of `paths` as text parts, whole files where they fit: code first, then tests."""
+    skip = proj.rcfg(repo, "gate")["review"]["skip_diff"]
+    is_test = lambda p: bool(re.search(r"(^|/)(tests?|__tests__|spec)/|[._-](test|spec)\.", p))  # noqa: E731
+    skipped = [p for p in paths if glob_any(p, skip)]
+    parts, cur, size = [], [], 0
+
+    def flush():
+        nonlocal cur, size
+        if cur:
+            parts.append("\n".join(cur))
+        cur, size = [], 0
+
+    for p in sorted((p for p in paths if p not in skipped), key=lambda p: (is_test(p), p)):
+        lines = run(["git", "-C", wt, "diff", "--no-color", "--no-renames", "-U8", base, "HEAD", "--", p]).stdout.splitlines()
+        while lines:
+            n, chars = 0, 0
+            while n < len(lines) and n < DIFF_PART_LINES and chars + len(lines[n]) + 1 <= DIFF_PART_CHARS:
+                chars += len(lines[n]) + 1
+                n += 1
+            n = n or 1
+            chunk, rest = lines[:n], lines[n:]
+            if cur and (len(cur) + len(chunk) > DIFF_PART_LINES or size + chars > DIFF_PART_CHARS):
+                flush()
+            cur += chunk
+            size += chars
+            if rest:
+                flush()
+                cur = ["(continues %s)" % p]
+                size = len(cur[0])
+            lines = rest
+    flush()
+    return parts, skipped
+
+
+def review_package(proj, st, args):
+    """Everything a reviewer reads, as files in the state directory, so it spends its turns judging, not collecting."""
+    task, repo, wt = st["task"], st.get("repo", proj.primary), st["worktree"]
+    head, d = git(wt, "rev-parse", "HEAD"), artifact(proj, task, "review")
+    rnd = int(st.get("review_round") or 0) + 1
+    base = git(wt, "merge-base", proj.base_ref(), "HEAD")
+    paths = [p for _, p in changed(wt, base)]
+    note = ""
+    if args.recheck:
+        prev = st.get("review_sha") or die("no earlier review package for %s; leave out --recheck" % task)
+        if not git_ok(wt, "merge-base", "--is-ancestor", prev, "HEAD"):
+            note = " The branch was rebased since, so base changes to the same files show up too: ignore those."
+        base = prev
+        touched = set(git(wt, "diff", "--name-only", "--no-renames", prev, "HEAD").splitlines())
+        paths = [p for p in paths if p in touched]
+    parts, skipped = diff_parts(proj, repo, wt, base, paths)
+    if os.path.isdir(d):
+        for f in glob.glob(os.path.join(d, "diff-*.txt")):
+            os.remove(f)
+    os.makedirs(d, exist_ok=True)
+    files = []
+    for n, text in enumerate(parts, 1):
+        f = os.path.join(d, "diff-%02d.txt" % n)
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        files.append(f)
+    stat = git(wt, "diff", "--stat=160", "--no-renames", base, "HEAD", "--", *paths) if paths else "(no changes)"
+    proj.save(task, review_round=rnd, review_sha=head)
+    findings = os.path.join(d, "findings-%d.md" % rnd)
+    lines = ["Diff (%s..%s, %d part(s); read them all, in parallel Read calls in one turn):"
+             % (base[:9], head[:9], len(files))] + ["  " + f for f in files]
+    if skipped:
+        lines.append("Generated files left out of the diff: " + ", ".join(skipped))
+    if args.recheck:
+        lines.insert(0, "This is a RE-REVIEW of the fix commits only.%s For each finding in %s say ADDRESSED or NOT "
+                        "ADDRESSED, then report new defects in the fix diff. Don't review the rest again."
+                     % (note, ", ".join(sorted(glob.glob(os.path.join(d, "findings-*.md")))) or "the earlier review"))
+    lines += ["Findings file: %s" % findings, "", "Files changed:", stat]
+    return lines, findings
 
 
 def cmd_review_brief(proj, args):
@@ -1375,7 +1620,163 @@ def cmd_review_brief(proj, args):
     if checklist or b["rules"]:
         lines += ["", "Project invariants to check:"] + ["- " + proj.fmt(x, c) for x in checklist + b["rules"]]
     lines.append("Implementer's report (read it last): %s/%s" % (c["wt"], REPORT))
-    print("\n".join(lines))
+    if not (args.write or args.recheck):
+        print("\n".join(lines))
+        return 0
+    extra, findings = review_package(proj, st, args)
+    lines += [""] + extra
+    if not args.recheck:
+        sections, skipped = inline_sections(proj, c, row if "phase" in row else dict(row, id=task))
+        if sections:
+            lines += ["", "Spec text, copied from the worktree. It is complete: don't search for or re-read these sections."]
+            for label, text in sections:
+                lines += ["", "===== %s =====" % label, text]
+        if skipped:
+            lines += ["", "Not copied (over brief.inline_max), read them yourself: " + "; ".join(skipped)]
+    path = artifact(proj, task, "review-brief.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    tier = proj.cfg["agents"]["review_tier"]
+    print("Agent parameters: %s (review tier %s)" % (tier_params(proj, tier), tier or "inherit"))
+    print("Prompt:")
+    print("Your complete review brief is %s (%d KB). Read it and every diff part it lists first, then review. Write the full "
+          "findings to %s, and reply with the verdict and one line per finding."
+          % (path, os.path.getsize(path) // 1024, findings))
+
+
+def cmd_fix_brief(proj, args):
+    """Prompt for a fresh agent that fixes review findings, without the first implementer's long context."""
+    st = proj.state(args.task)
+    if not st:
+        die("unknown task " + args.task)
+    task, d = st["task"], artifact(proj, st["task"], "review")
+    files = sorted(glob.glob(os.path.join(d, "findings-*.md")))
+    if not files:
+        die("no findings file in %s (the reviewer writes it)" % d)
+    name = proj.cfg["agents"]["escalate_tier"] or st.get("tier") or tier_name(proj, find_task(proj, task) or {"id": task})
+    print("Agent parameters: %s (tier %s)" % (tier_params(proj, name), name))
+    print("Prompt:")
+    print("\n".join([
+        "You fix review findings on task %s. The first implementer is gone; its work is committed on branch phase/%s."
+        % (task, norm_id(task)),
+        "Worktree (work only here): %s" % st["worktree"],
+        "Fix %s of %s." % ("finding(s) " + args.only if args.only else "every blocker and major", files[-1]),
+        "Read that file first, then the report %s/%s and, if it exists, the notes %s. The brief is %s: look up only the "
+        "parts a finding needs, with grep, and open only the code a finding names."
+        % (st["worktree"], REPORT, artifact(proj, task, "notes.md"), artifact(proj, task, "brief.md")),
+        "Each fix gets a test that fails without it. If a finding is wrong, change nothing for it and say why.",
+        "One commit `%s: review fixes`. Then run the gate until RESULT: PASS: %s check %s" % (task, proj.script, task),
+        "If it says you are behind: %s sync %s, and run the gate again." % (proj.script, task),
+        "Append a `## Review fixes` section to the report (finding → fix → test). Reply with the tip sha, the RESULT line "
+        "and one line per finding.",
+    ]))
+
+
+def minors_path(proj):
+    os.makedirs(proj.state_dir, exist_ok=True)
+    return os.path.join(proj.state_dir, "minors.md")
+
+
+def cmd_minor(proj, args):
+    """Minor review findings, kept for one batch fix instead of a fix round per task."""
+    with proj.lock(), open(minors_path(proj), "a", encoding="utf-8") as f:
+        f.write("- [ ] %s: %s\n" % (proj.state(args.task).get("task") or args.task, re.sub(r"\s+", " ", args.text).strip()))
+    print("recorded; `%s minors` lists them" % proj.script)
+
+
+def cmd_minors(proj, args):
+    path = minors_path(proj)
+    lines = open(path, encoding="utf-8").read().splitlines() if os.path.isfile(path) else []
+    if args.close:
+        with proj.lock():
+            for n in args.close:
+                if not 1 <= n <= len(lines):
+                    die("no minor %d" % n)
+                lines[n - 1] = lines[n - 1].replace("- [ ]", "- [x]", 1)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+    shown = [(n, l) for n, l in enumerate(lines, 1) if args.all or l.startswith("- [ ]")]
+    print("\n".join("%3d %s" % x for x in shown) or "no open minors")
+
+
+# $ per million tokens at API prices: input, output, cache read (2026-11). Cache writes cost 1.25x input (5 min), 2x (1 h).
+PRICES = {"claude-opus-5-5": (4, 20, .2), "claude-sonnet-5-5": (2, 10, .1), "claude-fable-5-2": (8, 40, .2)}
+
+
+def transcript_cost(path):
+    """Calls, largest context, output tokens, price, models and effort of one Claude Code transcript."""
+    seen, effort = {}, ""
+    for line in open(path, encoding="utf-8", errors="replace"):
+        if '"usage"' not in line and '"effort"' not in line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("type") == "api-request":
+            effort = ((o.get("params") or {}).get("output_config") or {}).get("effort") or effort
+        m = o.get("message")
+        if o.get("type") == "assistant" and isinstance(m, dict) and m.get("id"):
+            seen[m["id"]] = (m.get("model") or "", m.get("usage") or {})
+    n = lambda u, k: u.get(k) or 0  # noqa: E731
+    ctx = out = 0
+    usd, priced, models = 0.0, True, set()
+    for model, u in seen.values():
+        if model.startswith("<"):
+            continue
+        models.add(model)
+        cc = u.get("cache_creation") or {}
+        w5, w1 = n(cc, "ephemeral_5m_input_tokens"), n(cc, "ephemeral_1h_input_tokens")
+        if not cc:
+            w5 = n(u, "cache_creation_input_tokens")
+        ctx = max(ctx, n(u, "input_tokens") + n(u, "cache_read_input_tokens") + w5 + w1)
+        out += n(u, "output_tokens")
+        price = PRICES.get(model)
+        if not price:
+            priced = False
+            continue
+        usd += (price[0] * (n(u, "input_tokens") + 1.25 * w5 + 2 * w1) + price[1] * n(u, "output_tokens")
+                + price[2] * n(u, "cache_read_input_tokens")) / 1e6
+    return {"calls": len(seen), "ctx": ctx, "out": out, "usd": usd if priced else None, "models": models, "effort": effort}
+
+
+def cmd_cost(proj, args):
+    """What each task's agents cost, from Claude Code's transcripts (agent descriptions start with `<ID>:`)."""
+    slug = re.sub(r"[^A-Za-z0-9]", "-", proj.main)
+    root = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects", slug)
+    want = [norm_id(t) for t in args.task]
+    known = {norm_id(st["task"]): st for st in proj.states() if st.get("task")}
+    rows, totals = [], {}
+    for meta in sorted(glob.glob(os.path.join(root, "*", "subagents", "agent-*.meta.json")), key=os.path.getmtime):
+        try:
+            d = json.load(open(meta, encoding="utf-8"))
+        except ValueError:
+            continue
+        m = re.match(r"^([A-Za-z][A-Za-z0-9.]*\d[A-Za-z0-9.]*):\s*(.*)$", d.get("description") or "")
+        path = meta[:-len(".meta.json")] + ".jsonl"
+        if not m or norm_id(m.group(1)) not in known or not os.path.isfile(path):
+            continue
+        tid = norm_id(m.group(1))
+        ev = known[tid].get("events") or []
+        added = ev[0]["t"] if ev else 0
+        if (want and tid not in want) or (added and os.path.getmtime(path) < added):
+            continue
+        if not want and (not added or added < time.time() - args.days * 86400):
+            continue
+        t = transcript_cost(path)
+        role = re.sub(r"^(ship:)?phase-", "", d.get("agentType") or "?")
+        rows.append([known[tid]["task"], role, ",".join(sorted(x.replace("claude-", "") for x in t["models"])) or "-",
+                     t["effort"] or "-", t["calls"], "%dk" % (t["ctx"] // 1000), "%dk" % (t["out"] // 1000),
+                     "$%.2f" % t["usd"] if t["usd"] is not None else "-"])
+        totals.setdefault(known[tid]["task"], []).append(t["usd"] or 0)
+    if not rows:
+        print("no agent transcripts found under %s" % root)
+        return 0
+    print_table(["TASK", "ROLE", "MODEL", "EFFORT", "CALLS", "MAX CTX", "OUTPUT", "API PRICE"], rows)
+    print("\nper task: " + ", ".join("%s $%.2f" % (k, sum(v)) for k, v in totals.items()))
+    print("total: $%.2f for %d task(s), $%.2f each (API prices; a subscription counts usage its own way; the "
+          "orchestrator's own turns are not included)"
+          % (sum(map(sum, totals.values())), len(totals), sum(map(sum, totals.values())) / len(totals)))
 
 
 def cmd_note(proj, args):
@@ -1768,7 +2169,7 @@ def push(proj, d, repo, c):
         target = "git@github.com:" + url[len("https://github.com/"):]
         info("workflow files changed: pushing over SSH (%s)" % target)
     for attempt in range(3):
-        if git_ok(d, "push", "-q", target, "HEAD:refs/heads/" + proj.base):
+        if git_ok(d, "push", "-q", target, "HEAD:refs/heads/" + proj.base, timeout=PUSH_TIMEOUT):
             proj.fetch(proj.repo_root(repo))
             return git(d, "rev-parse", "HEAD")
         proj.fetch(proj.repo_root(repo))
@@ -2093,8 +2494,10 @@ def cmd_remove(proj, args):
         die("%s has unmerged commits (status %s). Use --force to drop them" % (br, st.get("status")))
     rep = os.path.join(wt, REPORT)
     keep = os.path.join(proj.state_dir, norm_id(task) + ".report.md")
-    if os.path.exists(rep) and not os.path.exists(keep):
+    if os.path.exists(rep):
         shutil.copy2(rep, keep)
+    for f in glob.glob(os.path.join(artifact(proj, task, "review"), "diff-*.txt")):
+        os.remove(f)
     c = proj.ctx(task)
     if os.path.isdir(wt):
         try:
@@ -2118,8 +2521,13 @@ Plan
   doctor                      check repos, base branch, env files, plan, tools, project checks, gh
   ready [SCOPE ...]           task states from the plan on the base branch: ready, blocked, manual, partial, running
                               SCOPE: phase ids, task ids, or all
-  brief <ID> [--inline-rules] implementer prompt (after add)
-  review-brief <ID>           reviewer prompt
+  brief <ID> [--write]        implementer prompt (after add). --write puts the brief in a file and prints the short
+      [--inline-rules]        prompt and the Agent parameters (model, effort) of the task's tier
+  tier <ID> [--escalate]      model and effort for the task's implementer and reviewer; --escalate moves it up
+  review-brief <ID> [--write] reviewer prompt. --write makes a package: brief with the spec text, and the diff in parts
+      [--recheck]             --recheck: only the fix commits since the last package
+  fix-brief <ID> [--only N,M] prompt for a fresh agent that fixes the reviewer's findings (default: blockers and majors)
+  minor <ID> "<text>"         keep a minor finding for a later batch; `minors [--all] [--close N ...]` lists and closes
 Work
   add <ID> [--repo NAME]      worktree + branch phase/<id> from the base, env, slot/port, setup hooks; resumes.
       [--force]               refuses past agents.max, a repo's max_agents, a phase cap or a serial task
@@ -2127,6 +2535,7 @@ Work
   status [--all]              every task: status, agent, ahead/behind, tree, gate, review need, last commit
   overlap                     files touched by more than one active task, or by the base since a task was cut
   stats [ID ...]              where the time went per task: build, gate runs, review wait, merge, land
+  cost [ID ...] [--days N]    what each agent cost, from Claude Code's transcripts: calls, largest context, price
   sync <ID> [--keep]          rebase the task onto the base (aborts on conflict unless --keep), refresh hooks
   check <ID> [--quick|--full] the gate: forbidden/owned/immutable files, rules, secrets, tests changed, skip
                               markers, per-file checks, test commands. Test commands that already passed on
@@ -2167,12 +2576,29 @@ def main(argv):
     if cmd == "lease":
         sub.add_argument("action", nargs="?", default="show", choices=["show", "release"])
         sub.add_argument("--force", action="store_true")
-    if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove", "approve", "mark"):
+    if cmd in ("brief", "review-brief", "add", "note", "sync", "check", "merge", "land", "smoke", "remove", "approve", "mark",
+               "tier", "fix-brief", "minor"):
         sub.add_argument("task")
     if cmd == "ready":
         sub.add_argument("scope", nargs="*")
     if cmd == "brief":
         sub.add_argument("--inline-rules", action="store_true")
+        sub.add_argument("--write", action="store_true")
+    if cmd == "tier":
+        sub.add_argument("--escalate", action="store_true")
+    if cmd == "review-brief":
+        sub.add_argument("--write", action="store_true")
+        sub.add_argument("--recheck", action="store_true")
+    if cmd == "fix-brief":
+        sub.add_argument("--only")
+    if cmd == "minor":
+        sub.add_argument("text")
+    if cmd == "minors":
+        sub.add_argument("--all", action="store_true")
+        sub.add_argument("--close", nargs="+", type=int)
+    if cmd == "cost":
+        sub.add_argument("task", nargs="*")
+        sub.add_argument("--days", type=float, default=7)
     if cmd == "add":
         sub.add_argument("repo_pos", nargs="?")
         sub.add_argument("--repo")
@@ -2209,8 +2635,8 @@ def main(argv):
         "doctor": cmd_doctor, "ready": cmd_ready, "brief": cmd_brief, "review-brief": cmd_review_brief,
         "add": cmd_add, "note": cmd_note, "status": cmd_status, "overlap": cmd_overlap, "sync": cmd_sync,
         "check": cmd_check, "merge": cmd_merge, "land": cmd_land, "abort": cmd_abort, "approve": cmd_approve,
-        "mark": cmd_mark, "lease": cmd_lease, "stats": cmd_stats,
-
+        "mark": cmd_mark, "lease": cmd_lease, "stats": cmd_stats, "cost": cmd_cost, "tier": cmd_tier,
+        "fix-brief": cmd_fix_brief, "minor": cmd_minor, "minors": cmd_minors,
         "deploy-wait": cmd_deploy_wait, "smoke": cmd_smoke, "remove": cmd_remove,
     }
     if cmd not in table:
@@ -2226,6 +2652,8 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_sig, lambda n, _f: sys.exit(128 + n))  # unwinds through wait_group, which kills its children
     try:
         sys.exit(main(sys.argv[1:]))
     except Busy as e:

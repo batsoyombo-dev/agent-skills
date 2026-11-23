@@ -29,9 +29,11 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `remote` | remote name (default `origin`); `null` = local only, so land fast-forwards the local base branch |
 | `vars` | values for placeholders (tool paths and the like) |
 | `agents.max` | implementers at once (default 5). `add` refuses past it, past a repo's `max_agents`, past a phase cap, and next to a serial task, unless `--force` |
-
+| `agents.tiers` | `{name: {model, effort}}`: named Agent tool parameters (`model`: `opus`, `sonnet`, ...; `effort`: `low` to `max`). Leave one out, or use `inherit`, to take the session's. Empty (default) = everything inherits |
+| `agents.default_tier`, `agents.tier_of` | the tier of a task whose plan row names none; `{task id: tier}` overrides the plan |
+| `agents.review_tier`, `agents.escalate_tier` | the tier of reviewers; the tier a task moves to when its first attempt is not enough (`tier <ID> --escalate`, `fix-brief`) |
 | `plan.file` | the plan file with the task tables, read from the base branch (required) |
-| `plan.columns` | header names per field: `id`, `task`, `deps`, `status`, `owner`, `spec`, `done_when`, `parallel` (case-insensitive lists) |
+| `plan.columns` | header names per field: `id`, `task`, `deps`, `status`, `owner`, `spec`, `done_when`, `parallel`, `tier` (case-insensitive lists) |
 | `plan.done` | regex on status that means done (default `^done\b`) |
 | `plan.agent_owners` | owner values (prefixes) a subagent may take; anything else is `manual` (default `agent` and empty) |
 | `plan.manual_markers` | text in the task cell that makes it manual (default `` `you` ``) |
@@ -52,8 +54,10 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `worktree.setup` | commands after creation (create databases, install, migrate); idempotent |
 | `worktree.refresh` | commands after a sync or squash (reinstall when lockfiles change, migrate) |
 | `worktree.teardown` | commands on remove (drop databases) |
+| `worktree.hook_timeout` | seconds before a setup, refresh or teardown hook is killed with its children (default 600). A hook over 30 s is named in the output |
 | `worktree.exclude` | extra paths for `.git/info/exclude` (generated config files) |
 | `gate.tests` | commands that must pass, run in the worktree for `check` and in the integration worktree for `merge` |
+| `gate.test_timeout` | seconds before one test command is killed (default 1800) |
 | `gate.conditional` | `[{when: regex on changed paths, run: [commands]}]`, e.g. integration tests when the schema changed |
 | `gate.per_file` | `[{glob, run, name}]` run on each added or modified file (`{file}`), e.g. a syntax check |
 | `gate.forbid` | globs that must never be committed (defaults cover env files, keys, `node_modules`, the report); `forbid_allow` lists exceptions |
@@ -66,6 +70,7 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `gate.no_tests_needed` | changed paths that need no tests (default `*.md`, `docs/*`) |
 | `gate.skip_markers` | regex for skipped/focused tests on added lines in `test_globs` (default covers PHPUnit, Jest/Vitest/Mocha, pytest, Go, Flutter `skip:`); empty to turn off |
 | `gate.review.lines` | changed lines above which review is required (default 400) |
+| `gate.review.skip_diff` | globs of generated files left out of the reviewer's diff (lock files, `*.gen.*`, snapshots) |
 | `gate.review.triggers` | `[{name, paths: regex}]`; a match makes review required, with that reason |
 | `land.progress_file` | must change in the landing commit; empty to skip |
 | `land.allow_after_merge` | globs the orchestrator may edit after merge's checks (default `docs/*`) |
@@ -77,6 +82,10 @@ Hooks run with `bash` in the worktree. They also get `PHASE_ID`, `PHASE_TASK`, `
 | `brief.rules` | project rules added to every implementer and reviewer prompt |
 | `brief.extra` | extra brief lines, e.g. "Migrations: name new files {migration_prefix}01_<name>" |
 | `brief.inline` | spec sections copied into the brief, so the implementer doesn't spend turns finding and reading them: `[{file, heading, names_from?}]`. `file` may use placeholders and globs (`{spec}`, `docs/plan/*.md`); `heading` is the start of the heading line (`## {ID}` matches `## T0.2 Add tenants`, not `## T0.20`), and the section runs to the next heading of the same or a higher level. With `names_from` (a regex with one group), the entry repeats for each name it finds in the sections copied so far, with `{name}` in `heading`: e.g. `` {"file": "docs/plan/02-data-model.md", "heading": "#### `{name}`", "names_from": "`([a-z_]+)`"} `` copies the subsection of every table the spec names. Scope plans always get their task block copied |
+| `brief.inline` with `line` | `{file, line, names_from?}` copies single lines instead of a section: rows of a requirements or decisions table. `line` is a regex that may use `{name}`: e.g. `{"file": "docs/prd.md", "line": "^\\| {name} \\|", "names_from": "\\b(DM-E\\d+-\\d+)\\b"}` copies the row of every requirement the spec cites |
+| `brief.inline` `names_in` | `"first"`: look for names only in the first section copied (the task's own spec). Without it every section copied so far counts, so one table's text can pull in tables and rows the task doesn't need |
+| `brief.exports` | `{regex, max}`: for each existing file the spec names in backticks, its length and the lines matching `regex` (exported signatures), up to `max` characters (default 8000). Empty regex = off. TypeScript: `^export (default )?(async )?(abstract )?(function\|class\|const\|type\|interface\|enum)\b` |
+| `brief.dep_reports` | characters of the direct dependencies' reports (Interfaces, Spec differences, Built) copied into the brief (default 6000; 0 = off) |
 | `brief.inline_max` | character budget for `brief.inline` (default 40000); sections past it are listed for the implementer to read |
 | `review.checklist` | project invariants the reviewer checks one by one |
 | `doctor.require` | tools that must exist (placeholders allowed) |
@@ -103,6 +112,18 @@ Markdown tables under phase headings, either `**P0: Name**` or `## P0: Name` (te
 - **State lock** (`.phase/state.lock`, flock, waits up to 60 s): every state write, and `add`'s capacity check + slot allocation + claim as one step, so racing adds can't exceed the limits or share a slot.
 - **Queue lock** (`.phase/queue.lock`, flock, no wait): held for all of `merge`, `land`, `mark` and `abort`, which share the integration worktree. Busy = exit 3.
 - flock locks are dropped by the kernel when a process exits, crash included, and are not inherited by hooks or test commands. They need a local filesystem: don't put `worktree.dir` on NFS.
+
+## Run files
+
+Briefs, notes, review packages (`<id>.brief.md`, `<id>.notes.md`, `<id>.review/`), kept reports and `minors.md` live in the state directory next to the task states, outside every worktree, so they can't be committed and don't trip formatters.
+
+## Timeouts
+
+`git fetch` is killed after 60 s (the last known base is used), a push after 300 s (land rebases and retries, up to 3 times), hooks after `worktree.hook_timeout`, test commands after `gate.test_timeout`. The whole process group goes, so nothing is left running; stopping phase.py itself (TERM or HUP) stops them too.
+
+## Cost
+
+`phase.py cost [ID ...] [--days N]` reads Claude Code's transcripts of this project (`$CLAUDE_CONFIG_DIR` or `~/.claude`) and prints, per agent, the model, effort, calls, largest context, output tokens and the price at API rates (`PRICES` in phase.py; `-` for a model not listed). It finds agents by their description, which must start with `<ID>:`. Compare a new tier or a config change with it before rolling it out: look at price per landed task, fix agents included, next to the review findings.
 
 ## Timing
 

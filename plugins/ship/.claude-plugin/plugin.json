@@ -1,6 +1,6 @@
 {
   "name": "ship",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Plan and ship code with agents. /ship:scope turns a brief into a validated phased plan; /ship:phase runs its tasks in parallel: one worktree and agent per task, a deterministic gate, independent review, and a serial merge queue onto the base branch. Configured per repo in .claude/phase.json.",
   "author": { "name": "batsoyombo-dev" },
   "keywords": ["planning", "spec", "orchestration", "worktrees", "parallel", "merge-queue", "quality-gates"]

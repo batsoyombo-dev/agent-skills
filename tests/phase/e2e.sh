@@ -51,7 +51,7 @@ cat > docs/plan/progress.md <<'EOF'
 | B1 | App screen | A1 | agent | |
 EOF
 printf 'greet() { echo hi; }\n' > src/lib.sh
-printf '# Spec\n## A1 Add greeting\nUse the `greetings` table.\n### Notes\ninner note A1\n## A10 Not this one\nA10 body\n' > docs/plan/spec.md
+printf '# Spec\n## A1 Add greeting\nUse the `greetings` table and `src/lib.sh`.\n### Notes\ninner note A1\n## A10 Not this one\nA10 body\n' > docs/plan/spec.md
 printf '# Data\n#### `greetings`\ngreetings columns\n#### `farewells`\nfarewells columns\n' > docs/plan/data.md
 printf 'one\n' > routes.txt
 printf 'create table t (id int);\n' > migrations/2026_01_01_100000_init.sql
@@ -144,6 +144,65 @@ hasnt "inlined section stops at the next heading" "$out" "A10 body"
 has "brief inlines sections named in the spec" "$out" "greetings columns"
 hasnt "brief skips sections the spec doesn't name" "$out" "farewells columns"
 
+echo "tiers, brief file"
+cp .claude/phase.json "$T/phase.json.bak"
+python3 - <<'EOF'
+import json
+c = json.load(open(".claude/phase.json"))
+c["agents"].update(tiers={"standard": {"model": "opus", "effort": "medium"}, "strong": {"model": "opus", "effort": "high"}},
+                   default_tier="standard", review_tier="strong", escalate_tier="strong", tier_of={"A2": "strong"})
+c["brief"]["inline"].append({"file": "docs/plan/progress.md", "line": r"^\| {name} \|", "names_from": r"## (A\d+)", "names_in": "first"})
+c["brief"]["exports"] = {"regex": r"^\w+\(\)"}
+json.dump(c, open(".claude/phase.json", "w"))
+EOF
+out=$(P brief A1 --write)
+has "brief --write prints the tier's parameters" "$out" "Agent parameters: model: opus, effort: medium \(tier standard\)"
+has "brief --write prints a short prompt" "$out" "Your complete brief is .*/.phase/a1.brief.md"
+hasnt "brief --write keeps the spec out of the prompt" "$out" "inner note A1"
+b=$(cat .worktrees/.phase/a1.brief.md)
+has "brief file has the spec" "$b" "inner note A1"
+has "brief file copies named lines" "$b" "^\| A1 \| Add greeting"
+hasnt "and only those" "$b" "^\| A2 \|"
+has "brief maps the files the spec names" "$b" "^src/lib.sh \(1 lines\)"; has "with their exports" "$b" "1: greet\(\)"
+has "brief names the notes file" "$b" "Notes: .*a1.notes.md"
+has "tier_of overrides the default" "$(P tier A2)" "build: +strong -> model: opus, effort: high"
+P tier A1 --escalate >/dev/null
+has "escalated tier sticks" "$(P brief A1 --write)" "effort: high \(tier strong\)"
+has "ready rows still print" "$(P ready)" "A3 .*blocked"
+python3 -c 'import json; c=json.load(open(".claude/phase.json")); c["agents"]["tier_of"]={"A1":"nope"}; json.dump(c, open(".claude/phase.json","w"))'
+P note A1 tier= >/dev/null
+has "unknown tier is refused" "$(P tier A1)" "unknown tier 'nope'"
+
+echo "timeouts"
+python3 - <<'EOF'
+import json
+c = json.load(open(".claude/phase.json"))
+c["worktree"].update(hook_timeout=1, refresh=["sleep 31.4159 & wait"])
+json.dump(c, open(".claude/phase.json", "w"))
+EOF
+out=$(cd "$T/proj" && python3 - "$PHASE" <<'EOF'
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("phase", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+proj, t = m.Project("."), time.time()
+try:
+    m.run_hooks(proj, proj.ctx("A1"), proj.rcfg("core", "worktree")["refresh"], "refresh", ".")
+except m.Fail as e:
+    print("%s | in %s" % (e, "time" if time.time() - t < 10 else "LATE"))
+EOF
+)
+has "a hanging hook is killed and named" "$out" "sleep 31"; has "with the reason, in time" "$(printf '%s' "$out" | tr '\n' ' ')" "timed out after 1s.*in time"
+hasnt "its children are gone" "$(ps -Ao args | grep -xE 'sleep 31[.]4159' || true)" "sleep"
+cp "$T/phase.json.bak" .claude/phase.json
+# stopping phase.py itself must not leave its tests running
+python3 - "$PHASE" <<'EOF' &
+import importlib.util, signal, sys
+spec = importlib.util.spec_from_file_location("phase", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+signal.signal(signal.SIGTERM, lambda n, _f: sys.exit(128 + n))
+m.run("sleep 32.7182 & wait", shell=True, timeout=60)
+EOF
+pid=$!; sleep 1; kill -TERM $pid; wait $pid 2>/dev/null
+hasnt "stopping phase.py stops its children" "$(ps -Ao args | grep -xE 'sleep 32[.]7182' || true)" "sleep"
+
 # ---------------------------------------------------------------- gate catches violations
 echo "gate"
 ( cd .worktrees/a1
@@ -171,7 +230,7 @@ has "gate fails" "$out" "RESULT: FAIL"
   git checkout -q origin/staging -- docs/plan/progress.md migrations/2026_01_01_100000_init.sql
   printf 'hello() { greet; }\n' > src/hello.sh
   printf '# tests hello\n' > tests/a1_test.sh
-  printf '# A1 report\n## Smoke\n- `GET /index.html` → 200\n- `GET /missing` → 404\n' > .phase-report.md
+  printf '# A1 report\n## Interfaces\n- `hello()` in src/hello.sh\n## Smoke\n- `GET /index.html` → 200\n- `GET /missing` → 404\n' > .phase-report.md
   git add -A && git commit -qm "A1: fixes" )
 ( cd .worktrees/a2
   echo a2 >> routes.txt; printf 'bye() { echo bye; }\n' > src/bye.sh
@@ -179,6 +238,25 @@ has "gate fails" "$out" "RESULT: FAIL"
   git add -A && git commit -qm "A2: farewell" )
 has "quick gate says review is required" "$(P check A2 --quick)" "review required \\(schema\\)"
 has "review-brief works after a quick gate" "$(P review-brief A2)" "Why review is required: required \\(schema\\)"
+echo "review package, findings, minors"
+out=$(P review-brief A2 --write)
+has "review-brief --write prints a short prompt" "$out" "Your complete review brief is .*a2.review-brief.md"
+has "no tiers: nothing to set" "$out" "Agent parameters: no model or effort"
+rb=$(cat .worktrees/.phase/a2.review-brief.md)
+has "review brief lists the diff part" "$rb" "a2.review/diff-01.txt"
+has "diff part holds the change" "$(cat .worktrees/.phase/a2.review/diff-01.txt)" "bye\(\) \{ echo bye"
+has "review brief names the findings file" "$rb" "Findings file: .*a2.review/findings-1.md"
+has "fix-brief needs findings" "$(P fix-brief A2)" "no findings file"
+printf 'VERDICT: CHANGES\n1. src/bye.sh:1 major\n' > .worktrees/.phase/a2.review/findings-1.md
+out=$(P fix-brief A2 --only 1); has "fix-brief points at the findings" "$out" "Fix finding\(s\) 1 of .*findings-1.md"; has "fix-brief has the gate" "$out" "check A2"
+( cd .worktrees/a2 && printf 'bye() { echo goodbye; }\n' > src/bye.sh && git commit -qam "A2: review fixes" )
+out=$(P review-brief A2 --recheck); has "recheck is round 2" "$out" "findings-2.md"
+rd=$(cat .worktrees/.phase/a2.review/diff-01.txt)
+has "recheck shows the fix" "$rd" "echo goodbye"; hasnt "recheck leaves the rest out" "$rd" "alter table"
+P minor A2 "src/bye.sh:1: wording" >/dev/null
+has "minor is listed" "$(P minors)" "1 - \[ \] A2: src/bye.sh:1: wording"
+P minors --close 1 >/dev/null; has "minor closed" "$(P minors)" "no open minors"
+has "worktree stays clean of run files" "$(git -C .worktrees/a2 status --porcelain | wc -l | tr -d ' ')" "^0$"
 has "gate passes after fixes" "$(P check A1)" "RESULT: PASS"
 out=$(P check A1); has "gate reuses tests passed on the same commit" "$out" "not re-run"; has "reused gate passes" "$out" "RESULT: PASS"
 hasnt "check --full re-runs the tests" "$(P check A1 --full)" "not re-run"
@@ -257,6 +335,8 @@ P add A3 >/dev/null; ( cd .worktrees/a3 && echo wip > src/wip.sh && git add -A &
 has "remove refuses unmerged work" "$(P remove A3)" "unmerged commits"
 rm -rf .worktrees/a3
 has "add resumes the existing branch" "$(P add A3)" "resumed existing branch phase/a3"
+out=$(P brief A3)
+has "brief carries what the dependencies built" "$out" "`hello\(\)` in src/hello.sh"; hasnt "only the useful sections" "$out" "/index.html"
 has "resumed branch keeps its commit" "$(git -C .worktrees/a3 log -1 --format=%s)" "^wip$"
 for t in A1 A2 B1; do P remove $t >/dev/null; done; P remove A3 --force >/dev/null
 has "teardown hooks ran" "$(cat "$T/teardown.log")" "teardown b1"
